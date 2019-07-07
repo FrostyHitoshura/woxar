@@ -1,0 +1,7 @@
+dark.fl:        For World of Xeen's DARK.CC archive. (1)
+intro.fl        For World of Xeen's INTRO.CC archive. (1)
+scummvm-3.fl    For ScummVM's xeen.ccs archive, version 3. (2)
+xeen.fl         For World of Xeen's XEEN.CC archive. (1)
+
+(1): Data extracted from https://xeen.fandom.com/wiki/Filenames with minor fixes
+(2): List determined by reading the source code
