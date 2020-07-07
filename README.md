@@ -30,8 +30,8 @@ Other limitations not related to the obfuscation:
 - Each file offset is encoded as a 24 bit integer value. This puts a soft cap to a useful archive size to about 16.8M.
 
 ## Related Links
-[Original games on GOG](https://www.gog.com/game/might_and_magic_6_limited_edition)
-[Open Source implementation in ScummVM](https://www.scummvm.org/)
+- [Original games on GOG](https://www.gog.com/game/might_and_magic_6_limited_edition)
+- [Open Source implementation in ScummVM](https://www.scummvm.org/)
 
 ## To Do
 - Add support for Might and Magic III: Isles of Terra.
