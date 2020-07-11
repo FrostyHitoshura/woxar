@@ -818,8 +818,8 @@ impl Job for Hash {
     }
 }
 
-fn build_known_jobs() -> Vec<Box<dyn Job>> {
-    vec![
+fn build_known_jobs() -> [Box<dyn Job>; 4] {
+    [
         Box::new(Extract {}),
         Box::new(Create {}),
         Box::new(Compare {}),
@@ -827,7 +827,7 @@ fn build_known_jobs() -> Vec<Box<dyn Job>> {
     ]
 }
 
-fn exec_cmdline(args: &Vec<String>, stdout: &mut dyn Write) -> Result<(), WoxError> {
+fn exec_cmdline(args: &[String], stdout: &mut dyn Write) -> Result<(), WoxError> {
     let jobs = build_known_jobs();
 
     let mut app = App::new("woxar")
@@ -855,7 +855,7 @@ fn exec_cmdline(args: &Vec<String>, stdout: &mut dyn Write) -> Result<(), WoxErr
 }
 
 fn exec_cmdline_manage_errors(
-    args: &Vec<String>,
+    args: &[String],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
@@ -903,24 +903,25 @@ mod tests {
 
     #[test]
     fn rotate_add_crypt() {
-        let plaintext = vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let expected_crypt = vec![176, 159, 143, 126, 110, 93, 77, 60];
+        type Buf = [u8; 8];
+        const PLAINTEXT: Buf = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        const EXPECTED_CRYPT: Buf = [176, 159, 143, 126, 110, 93, 77, 60];
 
         let mut state = Crypt::RotateAdd(ROTATE_ADD_INITIAL);
-        let crypted = plaintext
+        let crypted = PLAINTEXT
             .iter()
             .map(|byte| crypt(&mut state, Direction::Read, *byte))
-            .collect::<Vec<u8>>();
+            .collect::<SmallVec<Buf>>();
 
-        assert_eq!(crypted, expected_crypt);
+        assert_eq!(&crypted[..], EXPECTED_CRYPT);
 
         let mut state = Crypt::RotateAdd(ROTATE_ADD_INITIAL);
         let decrypted = crypted
             .iter()
             .map(|byte| crypt(&mut state, Direction::Write, *byte))
-            .collect::<Vec<u8>>();
+            .collect::<SmallVec<Buf>>();
 
-        assert_eq!(plaintext, decrypted);
+        assert_eq!(PLAINTEXT, &decrypted[..]);
     }
 
     #[test]
@@ -928,14 +929,19 @@ mod tests {
         // Not expected to happen for real, simply make sure we don't crash!
         compute_hash(&[0; 0]);
 
-        assert_eq!(compute_hash(&[64; 1]), 64);
-        assert_eq!(compute_hash(&vec![12, 34]), 6178);
+        const SIXTY_FOUR: [u8; 1] = [64];
+        assert_eq!(compute_hash(&SIXTY_FOUR), 64);
+
+        const TWO_BYTES: [u8; 2] = [12, 34];
+        assert_eq!(compute_hash(&TWO_BYTES), 6178);
     }
 
     fn cmdline_expect(subcmd: Option<&str>, arg: &str, on_stdout: bool) {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
-        let mut cmdline: Vec<String> = vec!["unit-test".into()];
+        let mut cmdline = SmallVec::<[String; 3]>::new();
+
+        cmdline.push("unit-test".into());
 
         if let Some(subcmd_str) = subcmd {
             cmdline.push(subcmd_str.into());
