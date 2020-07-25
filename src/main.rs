@@ -323,13 +323,19 @@ impl<'a> ReadCursor<'a> {
         ]))
     }
 
-    fn read(&mut self, mut size: usize) -> Result<Vec<u8>, WoxError> {
-        let mut decrypted = Vec::with_capacity(size);
-
-        while size != 0 {
-            decrypted.push(self.read_u8()?);
-            size = size - 1;
+    fn read(&mut self, size: usize) -> Result<Vec<u8>, WoxError> {
+        let len = self.contents.data.len();
+        let next_offset = self.offset + size;
+        if next_offset > len {
+            return Err(WoxError::Error(ErrorCode::EndOfFile(len, next_offset - 1)));
         }
+
+        let decrypted = self.contents.data[self.offset..next_offset]
+            .iter()
+            .map(|i| crypt(&mut self.crypt, Direction::Read, *i))
+            .collect();
+
+        self.offset = next_offset;
 
         Ok(decrypted)
     }
@@ -363,7 +369,20 @@ impl<'a> WriteCursor<'a> {
     }
 
     fn write(&mut self, data: &Vec<u8>) -> Result<(), WoxError> {
-        data.iter().try_for_each(|byte| self.write_u8(*byte))
+        let cap = self.contents.data.capacity();
+        let next_len = self.contents.data.len() + data.len();
+        if next_len > cap {
+            return Err(WoxError::Error(ErrorCode::EndOfFile(cap, next_len - 1)));
+        }
+
+        let crypted = data
+            .iter()
+            .map(|o| crypt(&mut self.crypt, Direction::Write, *o))
+            .collect::<Vec<u8>>();
+
+        self.contents.data.extend_from_slice(&crypted);
+
+        Ok(())
     }
 }
 
