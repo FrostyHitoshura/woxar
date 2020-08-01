@@ -867,9 +867,10 @@ fn exec_cmdline(args: &[String], stdout: &mut dyn Write) -> Result<(), WoxError>
     }) {
         found.execute(&submatches, stdout)
     } else {
-        return Err(WoxError::Generic(
-            "Fatal internal error: Failed to find a subcommand".into(),
-        ));
+        return Err(WoxError::Generic(format!(
+            "No subcommand provided. Run '{} help' for details.",
+            args[0]
+        )));
     }
 }
 
