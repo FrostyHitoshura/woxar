@@ -16,7 +16,9 @@ use smallvec::SmallVec;
 use std::{
     collections::{btree_map::Entry::Vacant, BTreeMap, HashMap},
     convert::TryFrom,
-    env, error, fmt,
+    env, error,
+    ffi::OsStr,
+    fmt,
     fmt::{Display, Formatter},
     fs,
     fs::create_dir_all,
@@ -140,6 +142,7 @@ struct WriteCursor<'a> {
     crypt: Crypt,
 }
 
+#[derive(Copy, Clone)]
 struct TocEntry {
     id: u16,
     offset: u32, // XXX: Actually an u24...
@@ -158,6 +161,12 @@ struct TocIter<'a> {
 
 struct PayloadIter<'a> {
     toc: TocIter<'a>,
+}
+
+struct PayloadBufferedIter<'a> {
+    tocs: Vec<TocEntry>,
+    idx: usize,
+    contents: &'a Contents,
 }
 
 impl ListEntry {
@@ -262,6 +271,47 @@ impl Contents {
     fn payload_iter(&self) -> Result<PayloadIter, WoxError> {
         Ok(PayloadIter {
             toc: self.toc_iter()?,
+        })
+    }
+
+    fn payload_filtered_ordered_iter(
+        &self,
+        hashes: &[FileHash],
+    ) -> Result<PayloadBufferedIter, WoxError> {
+        // Read the whole toc and save the entries we are interested for
+        // XXX: This is suboptimal: if we found all the entries, we can stop reading the toc
+        // XXX: We clone TocEntry 2 times in this function, looks excessive
+        let mut acc: Vec<Option<TocEntry>> = vec![None; hashes.len()];
+        for entry_result in self.toc_iter()? {
+            let entry = entry_result?;
+
+            hashes.iter().enumerate().for_each(|(idx, hash)| {
+                if entry.id == *hash {
+                    acc[idx] = Some(entry.clone());
+                }
+            });
+        }
+
+        let results = acc
+            .iter()
+            .enumerate()
+            .map(|(idx, optional_entry)| {
+                if let Some(entry) = optional_entry {
+                    Ok(entry.clone())
+                } else {
+                    // XXX: Improve error message
+                    Err(WoxError::Generic(format!(
+                        "Failed to find file hash {} in archive",
+                        hashes[idx]
+                    )))
+                }
+            })
+            .collect::<Result<Vec<TocEntry>, WoxError>>()?;
+
+        Ok(PayloadBufferedIter {
+            tocs: results,
+            idx: 0,
+            contents: self,
         })
     }
 
@@ -460,6 +510,24 @@ impl<'a> Iterator for PayloadIter<'a> {
     }
 }
 
+impl<'a> Iterator for PayloadBufferedIter<'a> {
+    type Item = Result<(TocEntry, Vec<u8>), WoxError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx < self.tocs.len() {
+            let toc = self.tocs[self.idx].clone();
+            self.idx += 1;
+
+            match self.contents.fetch_payload(&toc) {
+                Ok(decrypted) => Some(Ok((toc, decrypted))),
+                Err(err) => Some(Err(err)),
+            }
+        } else {
+            None
+        }
+    }
+}
+
 impl Display for WoxError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
@@ -502,9 +570,11 @@ fn compute_hash(name: &[u8]) -> FileHash {
 }
 
 fn extract_cc_file(
+    stdout: &mut dyn Write,
     archive_path: &Path,
     list_file: Option<&Path>,
     root_directory: &Path,
+    optional_files: Option<Vec<&str>>,
 ) -> Result<(), WoxError> {
     let mut contents = Contents::new(fs::read(archive_path)?);
 
@@ -514,16 +584,38 @@ fn extract_cc_file(
 
     create_dir_all(root_directory)?;
 
-    contents.payload_iter()?.try_for_each(
-        |payload_result: Result<(TocEntry, Vec<u8>), WoxError>| -> Result<(), WoxError> {
-            let payload = payload_result?;
-            fs::write(
-                root_directory.join(contents.entry_name(&payload.0)),
-                payload.1,
-            )?;
-            Ok(())
-        },
-    )
+    if let Some(hashes) = optional_files.map(|files| {
+        files
+            .iter()
+            .map(|file|
+                // If it's a number, it's already a hash and use it as is
+                u16::from_str_radix(&file, 10).unwrap_or(compute_hash(file.as_bytes())))
+            .collect::<Vec<_>>()
+    }) {
+        // Extract specific files arm: writing order is important to respect the order the user set
+        // by the user on the command line
+        contents
+            .payload_filtered_ordered_iter(&hashes)?
+            .try_for_each(
+                |payload_result: Result<(TocEntry, Vec<u8>), WoxError>| -> Result<(), WoxError> {
+                    let (_entry, contents) = payload_result?;
+                    stdout.write_all(&contents)?;
+                    Ok(())
+                },
+            )
+    } else {
+        // Extract all files arm: writing order isn't important
+        contents.payload_iter()?.try_for_each(
+            |payload_result: Result<(TocEntry, Vec<u8>), WoxError>| -> Result<(), WoxError> {
+                let payload = payload_result?;
+                fs::write(
+                    root_directory.join(contents.entry_name(&payload.0)),
+                    payload.1,
+                )?;
+                Ok(())
+            },
+        )
+    }
 }
 
 struct FilePayload {
@@ -733,17 +825,28 @@ impl Job for Extract {
                 Arg::with_name("root")
                     .long("root")
                     .short("C")
-                    .required(true)
                     .value_name("DIRECTORY")
-                    .help("Directory to extract to"),
+                    .help("Directory to extract to, if not provided, extract to current directory"),
+            )
+            .arg(
+                Arg::with_name("file")
+                    .long("file")
+                    .short("f")
+                    .multiple(true)
+                    .value_name("ARCHIVED_FILE")
+                    .help("File name from the archive to extract, written to stdout. If a number is provided, it's assumed to be a file hash."),
             )
     }
 
-    fn execute(&self, matches: &ArgMatches, _stdout: &mut dyn Write) -> Result<(), WoxError> {
+    fn execute(&self, matches: &ArgMatches, stdout: &mut dyn Write) -> Result<(), WoxError> {
         extract_cc_file(
+            stdout,
             Path::new(matches.value_of_os("archive").unwrap()),
             matches.value_of_os("fl").and_then(|fl| Some(Path::new(fl))),
-            Path::new(matches.value_of_os("root").unwrap()),
+            Path::new(matches.value_of_os("root").unwrap_or(OsStr::new("."))),
+            matches
+                .values_of("file")
+                .map(|files_iter| files_iter.collect::<Vec<_>>()),
         )
     }
 }
@@ -865,7 +968,9 @@ fn exec_cmdline(args: &[String], stdout: &mut dyn Write) -> Result<(), WoxError>
             None
         }
     }) {
-        found.execute(&submatches, stdout)
+        found.execute(&submatches, stdout)?;
+        stdout.flush()?;
+        Ok(())
     } else {
         return Err(WoxError::Generic(format!(
             "No subcommand provided. Run '{} help' for details.",
