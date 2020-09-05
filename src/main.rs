@@ -926,16 +926,16 @@ impl Job for Hash {
     fn subcommand(&self) -> App {
         new_subcommand(
             self.name(),
-            "Compute the hash from a file and output on stdout",
+            "Compute the hash of a file name and output it on stdout",
         )
-        .arg(Arg::with_name("file").required(true))
+        .arg(Arg::with_name("name").required(true))
     }
 
     fn execute(&self, matches: &ArgMatches, stdout: &mut dyn Write) -> Result<(), WoxError> {
         Ok(writeln!(
             stdout,
             "{}",
-            compute_hash(&fs::read(matches.value_of_os("file").unwrap())?)
+            compute_hash(matches.value_of("name").unwrap().as_bytes())
         )?)
     }
 }
