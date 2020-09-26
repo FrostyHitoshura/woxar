@@ -103,6 +103,7 @@ impl From<ClapError> for WoxError {
 
 const ROTATE_ADD_INITIAL: u8 = 0xac;
 
+#[derive(Copy, Clone)]
 enum Crypt {
     None,          // Used for the initial 2 bytes of the file
     RotateAdd(u8), // Used for the table of contents
@@ -161,12 +162,14 @@ struct TocIter<'a> {
 
 struct PayloadIter<'a> {
     toc: TocIter<'a>,
+    contents_crypt: Crypt,
 }
 
 struct PayloadBufferedIter<'a> {
     tocs: Vec<TocEntry>,
     idx: usize,
     contents: &'a Contents,
+    contents_crypt: Crypt,
 }
 
 impl ListEntry {
@@ -268,15 +271,17 @@ impl Contents {
         })
     }
 
-    fn payload_iter(&self) -> Result<PayloadIter, WoxError> {
+    fn payload_iter(&self, contents_crypt: Crypt) -> Result<PayloadIter, WoxError> {
         Ok(PayloadIter {
             toc: self.toc_iter()?,
+            contents_crypt: contents_crypt,
         })
     }
 
     fn payload_filtered_ordered_iter(
         &self,
         hashes: &[FileHash],
+        contents_crypt: Crypt,
     ) -> Result<PayloadBufferedIter, WoxError> {
         // Read the whole toc and save the entries we are interested for
         // XXX: This is suboptimal: if we found all the entries, we can stop reading the toc
@@ -312,11 +317,12 @@ impl Contents {
             tocs: results,
             idx: 0,
             contents: self,
+            contents_crypt: contents_crypt,
         })
     }
 
-    fn fetch_payload(&self, entry: &TocEntry) -> Result<Vec<u8>, WoxError> {
-        self.read_cursor_at(entry.offset as usize, Crypt::Xor)
+    fn fetch_payload(&self, entry: &TocEntry, crypt: Crypt) -> Result<Vec<u8>, WoxError> {
+        self.read_cursor_at(entry.offset as usize, crypt)
             .read(entry.len as usize)
     }
 }
@@ -498,7 +504,11 @@ impl<'a> Iterator for PayloadIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(entry_result) = self.toc.next() {
             match entry_result {
-                Ok(entry) => match self.toc.contents().fetch_payload(&entry) {
+                Ok(entry) => match self
+                    .toc
+                    .contents()
+                    .fetch_payload(&entry, self.contents_crypt)
+                {
                     Ok(decrypted) => Some(Ok((entry, decrypted))),
                     Err(err) => Some(Err(err)),
                 },
@@ -518,7 +528,7 @@ impl<'a> Iterator for PayloadBufferedIter<'a> {
             let toc = self.tocs[self.idx].clone();
             self.idx += 1;
 
-            match self.contents.fetch_payload(&toc) {
+            match self.contents.fetch_payload(&toc, self.contents_crypt) {
                 Ok(decrypted) => Some(Ok((toc, decrypted))),
                 Err(err) => Some(Err(err)),
             }
@@ -575,6 +585,7 @@ fn extract_cc_file(
     list_file: Option<&Path>,
     root_directory: &Path,
     optional_files: Option<Vec<&str>>,
+    contents_crypt: Crypt,
 ) -> Result<(), WoxError> {
     let mut contents = Contents::new(fs::read(archive_path)?);
 
@@ -595,7 +606,7 @@ fn extract_cc_file(
         // Extract specific files arm: writing order is important to respect the order the user set
         // by the user on the command line
         contents
-            .payload_filtered_ordered_iter(&hashes)?
+            .payload_filtered_ordered_iter(&hashes, contents_crypt)?
             .try_for_each(
                 |payload_result: Result<(TocEntry, Vec<u8>), WoxError>| -> Result<(), WoxError> {
                     let (_entry, contents) = payload_result?;
@@ -605,7 +616,7 @@ fn extract_cc_file(
             )
     } else {
         // Extract all files arm: writing order isn't important
-        contents.payload_iter()?.try_for_each(
+        contents.payload_iter(contents_crypt)?.try_for_each(
             |payload_result: Result<(TocEntry, Vec<u8>), WoxError>| -> Result<(), WoxError> {
                 let payload = payload_result?;
                 fs::write(
@@ -623,7 +634,11 @@ struct FilePayload {
     payload: Vec<u8>,
 }
 
-fn create_cc_file(archive_path: &Path, root_directory: &Path) -> Result<(), WoxError> {
+fn create_cc_file(
+    archive_path: &Path,
+    root_directory: &Path,
+    contents_crypt: Crypt,
+) -> Result<(), WoxError> {
     const TOC_START: usize = 2;
     const TOC_EACH_SIZE: usize = 8; // sizeof(TocEntry) + 1
     let mut cache: BTreeMap<FileHash, FilePayload> = BTreeMap::new();
@@ -698,7 +713,7 @@ fn create_cc_file(archive_path: &Path, root_directory: &Path) -> Result<(), WoxE
     })?;
 
     // Step 3: Get ready and write all the contents of the archive
-    cursor.crypt = Crypt::Xor;
+    cursor.crypt = contents_crypt;
     cache
         .values()
         .try_for_each(|file_payload| cursor.write(&file_payload.payload))?;
@@ -709,6 +724,9 @@ fn create_cc_file(archive_path: &Path, root_directory: &Path) -> Result<(), WoxE
 
 fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
     type Toc = BTreeMap<FileHash, TocEntry>;
+
+    // We don't care about the crypto used for the file contents, use the least expensive one
+    let contents_crypt = Crypt::None;
 
     // Step 1: Load archives data from disk
     let contents = paths
@@ -765,8 +783,8 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
         .zip(tocs[1].values())
         .all(|(a_entry, b_entry)| {
             if let (Ok(a_payload), Ok(b_payload)) = (
-                contents[0].fetch_payload(&a_entry),
-                contents[1].fetch_payload(&b_entry),
+                contents[0].fetch_payload(&a_entry, contents_crypt),
+                contents[1].fetch_payload(&b_entry, contents_crypt),
             ) {
                 a_payload == b_payload
             } else {
@@ -836,6 +854,13 @@ impl Job for Extract {
                     .value_name("ARCHIVED_FILE")
                     .help("File name from the archive to extract, written to stdout. If a number is provided, it's assumed to be a file hash."),
             )
+            .arg(
+                Arg::with_name("disable-contents-crypt")
+                .long("disable-contents-crypt")
+                .required(false)
+                .takes_value(false)
+                .help("Don't decrypt the file contents"),
+            )
     }
 
     fn execute(&self, matches: &ArgMatches, stdout: &mut dyn Write) -> Result<(), WoxError> {
@@ -847,6 +872,11 @@ impl Job for Extract {
             matches
                 .values_of("file")
                 .map(|files_iter| files_iter.collect::<Vec<_>>()),
+            if matches.is_present("disable-contents-crypt") {
+                Crypt::None
+            } else {
+                Crypt::Xor
+            },
         )
     }
 }
@@ -876,12 +906,24 @@ impl Job for Create {
                     .value_name("DIRECTORY")
                     .help("Directory containing the files to archive"),
             )
+            .arg(
+                Arg::with_name("disable-contents-crypt")
+                    .long("disable-contents-crypt")
+                    .required(false)
+                    .takes_value(false)
+                    .help("Don't decrypt the file contents"),
+            )
     }
 
     fn execute(&self, matches: &ArgMatches, _stdout: &mut dyn Write) -> Result<(), WoxError> {
         create_cc_file(
             Path::new(matches.value_of_os("archive").unwrap()),
             Path::new(matches.value_of_os("root").unwrap()),
+            if matches.is_present("disable-contents-crypt") {
+                Crypt::None
+            } else {
+                Crypt::Xor
+            },
         )
     }
 }

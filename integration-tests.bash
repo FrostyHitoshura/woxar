@@ -133,6 +133,11 @@ for cc_base in "intro" "xeen" "dark"; do
             cat "${extracted_dir}/${file}"
         done > "${rebuilt_save}"
         cmp "${extracted_save}" "${rebuilt_save}"
+
+        # Extract the save file: these subarchive are not encrypted
+        extracted_save_dir="${scratch_dir}/${cc_base}_save"
+        mkdir -p "${extracted_save_dir}"
+        ${tool} ${exe} extract --archive "${extracted_save}" --root "${extracted_save_dir}" --fl "data/save.fl" --disable-contents-crypt
     fi
 
     ${end_tests}
