@@ -2,10 +2,6 @@
 //!
 //! https://xeen.fandom.com/wiki/CC_File_Format
 
-#![deny(warnings)]
-
-extern crate bit_vec;
-
 use bit_vec::BitVec;
 use clap::{
     App, Arg, ArgMatches, Error as ClapError,
@@ -21,8 +17,8 @@ use std::{
     fmt,
     fmt::{Display, Formatter},
     fs,
-    fs::create_dir_all,
-    io::{stderr, stdout, Error as IoError, Write},
+    fs::{create_dir_all, File},
+    io::{stderr, stdout, Cursor, Error as IoError, Read, Write},
     num::{ParseIntError, TryFromIntError},
     path::Path,
     process::exit,
@@ -31,8 +27,8 @@ use std::{
     u16,
 };
 
-const VERSION: &'static str = env!("CARGO_PKG_VERSION");
-const AUTHOR: &'static str = env!("CARGO_PKG_AUTHORS");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
 
 fn parse_u16_hex(input: &str) -> Result<u16, ParseIntError> {
     let starting_offset = if input.starts_with("0x") || input.starts_with("0X") {
@@ -175,7 +171,7 @@ struct PayloadBufferedIter<'a> {
 impl ListEntry {
     fn new(name: String) -> ListEntry {
         ListEntry {
-            name: name,
+            name,
             expected_hash: None,
             expected_size: None,
         }
@@ -185,19 +181,19 @@ impl ListEntry {
 impl Contents {
     fn new(data: Vec<u8>) -> Contents {
         Contents {
-            data: data,
+            data,
             list: HashMap::new(),
         }
     }
 
     fn parse_list(&mut self, data: Vec<u8>) -> Result<(), WoxError> {
         data.split(|byte| *byte == b'\n')
-            .filter(|line| line.len() >= 1)
+            .filter(|line| !line.is_empty())
             .try_for_each(|line: &[u8]| -> Result<(), WoxError> {
                 let mut csv = line.split(|byte| *byte == b',');
 
                 if let Some(name) = csv.next() {
-                    if name.len() < 1 {
+                    if name.is_empty() {
                         return Err(WoxError::Error(ErrorCode::FileName));
                     }
 
@@ -227,7 +223,7 @@ impl Contents {
 
     fn entry_name(&self, entry: &TocEntry) -> String {
         match self.find_entry(entry.id) {
-            Some(entry) => format!("{}", entry.name),
+            Some(entry) => entry.name.to_string(),
             None => format!("{}", entry.id),
         }
     }
@@ -235,8 +231,8 @@ impl Contents {
     fn read_cursor_at(&self, offset: usize, crypt: Crypt) -> ReadCursor {
         ReadCursor {
             contents: self,
-            offset: offset,
-            crypt: crypt,
+            offset,
+            crypt,
         }
     }
 
@@ -252,7 +248,7 @@ impl Contents {
     }
 
     fn file_count(&self) -> Result<FileCount, WoxError> {
-        Ok(self.read_cursor().read_u16()?)
+        self.read_cursor().read_u16()
     }
 
     fn toc_iter(&self) -> Result<TocIter, WoxError> {
@@ -264,9 +260,9 @@ impl Contents {
         cursor.crypt = Crypt::RotateAdd(ROTATE_ADD_INITIAL);
 
         Ok(TocIter {
-            cursor: cursor,
+            cursor,
             idx: 0,
-            total: total,
+            total,
             verify: BitVec::from_elem(FileHash::max_value() as usize, false),
         })
     }
@@ -274,7 +270,7 @@ impl Contents {
     fn payload_iter(&self, contents_crypt: Crypt) -> Result<PayloadIter, WoxError> {
         Ok(PayloadIter {
             toc: self.toc_iter()?,
-            contents_crypt: contents_crypt,
+            contents_crypt,
         })
     }
 
@@ -292,7 +288,7 @@ impl Contents {
 
             hashes.iter().enumerate().for_each(|(idx, hash)| {
                 if entry.id == *hash {
-                    acc[idx] = Some(entry.clone());
+                    acc[idx] = Some(entry);
                 }
             });
         }
@@ -302,7 +298,7 @@ impl Contents {
             .enumerate()
             .map(|(idx, optional_entry)| {
                 if let Some(entry) = optional_entry {
-                    Ok(entry.clone())
+                    Ok(*entry)
                 } else {
                     // XXX: Improve error message
                     Err(WoxError::Generic(format!(
@@ -317,7 +313,7 @@ impl Contents {
             tocs: results,
             idx: 0,
             contents: self,
-            contents_crypt: contents_crypt,
+            contents_crypt,
         })
     }
 
@@ -360,7 +356,7 @@ impl<'a> ReadCursor<'a> {
             Err(WoxError::Error(ErrorCode::EndOfFile(len, self.offset)))
         } else {
             let byte = self.contents.data[self.offset];
-            self.offset = self.offset + 1;
+            self.offset += 1;
 
             Ok(crypt(&mut self.crypt, Direction::Read, byte))
         }
@@ -424,7 +420,7 @@ impl<'a> WriteCursor<'a> {
         self.write_u8((byte >> 16) as u8)
     }
 
-    fn write(&mut self, data: &Vec<u8>) -> Result<(), WoxError> {
+    fn write(&mut self, data: &[u8]) -> Result<(), WoxError> {
         let cap = self.contents.data.capacity();
         let next_len = self.contents.data.len() + data.len();
         if next_len > cap {
@@ -525,7 +521,7 @@ impl<'a> Iterator for PayloadBufferedIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx < self.tocs.len() {
-            let toc = self.tocs[self.idx].clone();
+            let toc = self.tocs[self.idx];
             self.idx += 1;
 
             match self.contents.fetch_payload(&toc, self.contents_crypt) {
@@ -569,7 +565,7 @@ impl error::Error for WoxError {
 }
 
 fn compute_hash(name: &[u8]) -> FileHash {
-    if name.len() == 0 {
+    if name.is_empty() {
         // Follows ScummVM's BaseCCArchive::convertNameToId
         0xffff
     } else {
@@ -579,19 +575,27 @@ fn compute_hash(name: &[u8]) -> FileHash {
     }
 }
 
-fn extract_cc_file(
-    stdout: &mut dyn Write,
-    archive_path: &Path,
-    list_file: Option<&Path>,
+fn extract_cc_file<A, S, L>(
+    stdout: &mut S,
+    archive_stream: &mut A,
+    mut list_stream: L,
     root_directory: &Path,
     optional_files: Option<Vec<&str>>,
     contents_crypt: Crypt,
-) -> Result<(), WoxError> {
-    let mut contents = Contents::new(fs::read(archive_path)?);
+) -> Result<(), WoxError>
+where
+    A: Read,
+    S: Write,
+    L: Read,
+{
+    let mut data = Vec::<u8>::new();
+    archive_stream.read_to_end(&mut data)?;
 
-    if let Some(lf) = list_file {
-        contents.parse_list(fs::read(lf)?)?
-    };
+    let mut contents = Contents::new(data);
+
+    let mut data = Vec::<u8>::new();
+    list_stream.read_to_end(&mut data)?;
+    contents.parse_list(data)?;
 
     create_dir_all(root_directory)?;
 
@@ -600,7 +604,7 @@ fn extract_cc_file(
             .iter()
             .map(|file|
                 // If it's a number, it's already a hash and use it as is
-                u16::from_str_radix(&file, 10).unwrap_or(compute_hash(file.as_bytes())))
+                file.parse::<u16>().unwrap_or_else(|_| compute_hash(file.as_bytes())))
             .collect::<Vec<_>>()
     }) {
         // Extract specific files arm: writing order is important to respect the order the user set
@@ -657,7 +661,9 @@ fn create_cc_file(
                     // decimal as file name. So first try to parse the file name as a u16 and it
                     // works, then assume it's the hash. Otherwise, it's a real file name and
                     // compute the hash from it.
-                    id: u16::from_str_radix(&path, 10).unwrap_or(compute_hash(path.as_bytes())),
+                    id: path
+                        .parse::<u16>()
+                        .unwrap_or_else(|_| compute_hash(path.as_bytes())),
                     offset: 0, // Will be filled later
                     len: FileSize::try_from(dir_entry.metadata()?.len())?,
                 };
@@ -737,7 +743,7 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
     // Step 2: If there's a difference in file count, then the archive are different
     let file_counts = contents
         .iter()
-        .map(|content| Ok(content.file_count()?))
+        .map(|content| content.file_count())
         .collect::<Result<SmallVec<[FileSize; 2]>, WoxError>>()?;
 
     if file_counts[0] != file_counts[1] {
@@ -803,10 +809,13 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
     }
 }
 
-trait Job {
+trait Job<S>
+where
+    S: Write,
+{
     fn name(&self) -> &'static str;
     fn subcommand(&self) -> App;
-    fn execute(&self, args: &ArgMatches, stdout: &mut dyn Write) -> Result<(), WoxError>;
+    fn execute(&self, args: &ArgMatches, stdout: &mut S) -> Result<(), WoxError>;
 }
 
 fn new_subcommand<'a>(name: &'a str, about: &'a str) -> App<'a, 'a> {
@@ -818,13 +827,48 @@ fn new_subcommand<'a>(name: &'a str, about: &'a str) -> App<'a, 'a> {
 
 struct Extract {}
 
-impl Job for Extract {
+impl Extract {
+    fn execute_with_file_list<S, L>(
+        &self,
+        matches: &ArgMatches,
+        stdout: &mut S,
+        file_list: L,
+    ) -> Result<(), WoxError>
+    where
+        S: Write,
+        L: Read,
+    {
+        extract_cc_file(
+            stdout,
+            &mut File::open(matches.value_of_os("archive").unwrap())?,
+            file_list,
+            Path::new(
+                matches
+                    .value_of_os("root")
+                    .unwrap_or_else(|| OsStr::new(".")),
+            ),
+            matches
+                .values_of("file")
+                .map(|files_iter| files_iter.collect::<Vec<_>>()),
+            if matches.is_present("disable-contents-crypt") {
+                Crypt::None
+            } else {
+                Crypt::Xor
+            },
+        )
+    }
+}
+
+impl<S> Job<S> for Extract
+where
+    S: Write,
+{
     fn name(&self) -> &'static str {
         "extract"
     }
 
     fn subcommand(&self) -> App {
-        new_subcommand(self.name(), "Extract an archive to a new directory")
+        new_subcommand(<Self as Job<S>>::name(self), "Extract an archive to a new directory")
             .arg(
                 Arg::with_name("archive")
                     .long("archive")
@@ -863,59 +907,56 @@ impl Job for Extract {
             )
     }
 
-    fn execute(&self, matches: &ArgMatches, stdout: &mut dyn Write) -> Result<(), WoxError> {
-        extract_cc_file(
-            stdout,
-            Path::new(matches.value_of_os("archive").unwrap()),
-            matches.value_of_os("fl").and_then(|fl| Some(Path::new(fl))),
-            Path::new(matches.value_of_os("root").unwrap_or(OsStr::new("."))),
-            matches
-                .values_of("file")
-                .map(|files_iter| files_iter.collect::<Vec<_>>()),
-            if matches.is_present("disable-contents-crypt") {
-                Crypt::None
-            } else {
-                Crypt::Xor
-            },
-        )
+    fn execute(&self, matches: &ArgMatches, stdout: &mut S) -> Result<(), WoxError> {
+        if let Some(fl) = matches.value_of_os("fl") {
+            self.execute_with_file_list(matches, stdout, &mut File::open(fl)?)
+        } else {
+            self.execute_with_file_list(matches, stdout, &mut Cursor::new(&[]))
+        }
     }
 }
 
 struct Create {}
 
-impl Job for Create {
+impl<S> Job<S> for Create
+where
+    S: Write,
+{
     fn name(&self) -> &'static str {
         "create"
     }
 
     fn subcommand(&self) -> App {
-        new_subcommand(self.name(), "Create an archive from an existing directory")
-            .arg(
-                Arg::with_name("archive")
-                    .long("archive")
-                    .short("a")
-                    .required(true)
-                    .value_name("FILE")
-                    .help("Archive file to create"),
-            )
-            .arg(
-                Arg::with_name("root")
-                    .long("root")
-                    .short("C")
-                    .required(true)
-                    .value_name("DIRECTORY")
-                    .help("Directory containing the files to archive"),
-            )
-            .arg(
-                Arg::with_name("disable-contents-crypt")
-                    .long("disable-contents-crypt")
-                    .required(false)
-                    .takes_value(false)
-                    .help("Don't decrypt the file contents"),
-            )
+        new_subcommand(
+            <Self as Job<S>>::name(self),
+            "Create an archive from an existing directory",
+        )
+        .arg(
+            Arg::with_name("archive")
+                .long("archive")
+                .short("a")
+                .required(true)
+                .value_name("FILE")
+                .help("Archive file to create"),
+        )
+        .arg(
+            Arg::with_name("root")
+                .long("root")
+                .short("C")
+                .required(true)
+                .value_name("DIRECTORY")
+                .help("Directory containing the files to archive"),
+        )
+        .arg(
+            Arg::with_name("disable-contents-crypt")
+                .long("disable-contents-crypt")
+                .required(false)
+                .takes_value(false)
+                .help("Don't decrypt the file contents"),
+        )
     }
 
-    fn execute(&self, matches: &ArgMatches, _stdout: &mut dyn Write) -> Result<(), WoxError> {
+    fn execute(&self, matches: &ArgMatches, _stdout: &mut S) -> Result<(), WoxError> {
         create_cc_file(
             Path::new(matches.value_of_os("archive").unwrap()),
             Path::new(matches.value_of_os("root").unwrap()),
@@ -930,50 +971,58 @@ impl Job for Create {
 
 struct Compare {}
 
-impl Job for Compare {
+impl<S> Job<S> for Compare
+where
+    S: Write,
+{
     fn name(&self) -> &'static str {
         "compare"
     }
 
     fn subcommand(&self) -> App {
-        new_subcommand(self.name(), "Compare two or more archives")
+        new_subcommand(<Self as Job<S>>::name(self), "Compare two or more archives")
             .arg(Arg::with_name("archives").multiple(true))
     }
 
-    fn execute(&self, matches: &ArgMatches, _stdout: &mut dyn Write) -> Result<(), WoxError> {
+    fn execute(&self, matches: &ArgMatches, _stdout: &mut S) -> Result<(), WoxError> {
         let mut iter = matches.values_of("archives").unwrap();
         let first = iter.next();
         let second = iter.next();
         let third = iter.next();
 
-        if first.is_none() || second.is_none() {
+        if third.is_some() {
+            unimplemented!()
+        }
+
+        if let (Some(first), Some(second)) = (first, second) {
+            compare_cc_files([Path::new(first), Path::new(second)])
+        } else {
             Err(WoxError::Generic(
                 "Requires 2 or more archives to compare".into(),
             ))
-        } else if third.is_some() {
-            unimplemented!()
-        } else {
-            compare_cc_files([Path::new(first.unwrap()), Path::new(second.unwrap())])
         }
     }
 }
 
 struct Hash {}
 
-impl Job for Hash {
+impl<S> Job<S> for Hash
+where
+    S: Write,
+{
     fn name(&self) -> &'static str {
         "hash"
     }
 
     fn subcommand(&self) -> App {
         new_subcommand(
-            self.name(),
+            <Self as Job<S>>::name(self),
             "Compute the hash of a file name and output it on stdout",
         )
         .arg(Arg::with_name("name").required(true))
     }
 
-    fn execute(&self, matches: &ArgMatches, stdout: &mut dyn Write) -> Result<(), WoxError> {
+    fn execute(&self, matches: &ArgMatches, stdout: &mut S) -> Result<(), WoxError> {
         Ok(writeln!(
             stdout,
             "{}",
@@ -982,7 +1031,10 @@ impl Job for Hash {
     }
 }
 
-fn build_known_jobs() -> [Box<dyn Job>; 4] {
+fn build_known_jobs<S>() -> [Box<dyn Job<S>>; 4]
+where
+    S: Write,
+{
     [
         Box::new(Extract {}),
         Box::new(Create {}),
@@ -991,8 +1043,11 @@ fn build_known_jobs() -> [Box<dyn Job>; 4] {
     ]
 }
 
-fn exec_cmdline(args: &[String], stdout: &mut dyn Write) -> Result<(), WoxError> {
-    let jobs = build_known_jobs();
+fn exec_cmdline<S>(args: &[String], stdout: &mut S) -> Result<(), WoxError>
+where
+    S: Write,
+{
+    let jobs = build_known_jobs::<S>();
 
     let mut app = App::new("woxar")
         .version(VERSION)
@@ -1004,11 +1059,9 @@ fn exec_cmdline(args: &[String], stdout: &mut dyn Write) -> Result<(), WoxError>
     let matches = app.get_matches_from_safe(args)?;
 
     if let Some((found, submatches)) = jobs.iter().find_map(|job| {
-        if let Some(submatches) = matches.subcommand_matches(job.name()) {
-            Some((job, submatches))
-        } else {
-            None
-        }
+        matches
+            .subcommand_matches(job.name())
+            .map(|submatches| (job, submatches))
     }) {
         found.execute(&submatches, stdout)?;
         stdout.flush()?;
@@ -1021,11 +1074,11 @@ fn exec_cmdline(args: &[String], stdout: &mut dyn Write) -> Result<(), WoxError>
     }
 }
 
-fn exec_cmdline_manage_errors(
-    args: &[String],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> bool {
+fn exec_cmdline_manage_errors<S, E>(args: &[String], stdout: &mut S, stderr: &mut E) -> bool
+where
+    S: Write,
+    E: Write,
+{
     if let Err(err) = exec_cmdline(args, stdout) {
         match err {
             WoxError::ClapError(clap_err)
@@ -1130,7 +1183,7 @@ mod tests {
 
     #[test]
     fn cmdline_help_n_version() {
-        let jobs = build_known_jobs();
+        let jobs = build_known_jobs::<Vec<u8>>();
 
         // Note: clap behavior is different for --help and --version. The former will write the
         // message in the generated Error while the latter will print directly to stdout, bypassing
