@@ -18,7 +18,7 @@ use std::{
     fmt::{Display, Formatter},
     fs,
     fs::{create_dir_all, File},
-    io::{stderr, stdout, Cursor, Error as IoError, Read, Write},
+    io::{stderr, stdout, BufRead, BufReader, Cursor, Error as IoError, Read, Write},
     num::{ParseIntError, TryFromIntError},
     path::Path,
     process::exit,
@@ -117,9 +117,13 @@ struct ListEntry {
     expected_size: Option<FileSize>,
 }
 
+struct FileList {
+    list: ListHash,
+}
+
 struct Contents {
     data: Vec<u8>,
-    list: ListHash,
+    list: FileList,
 }
 
 #[derive(PartialEq, Debug)]
@@ -178,47 +182,66 @@ impl ListEntry {
     }
 }
 
-impl Contents {
-    fn new(data: Vec<u8>) -> Contents {
-        Contents {
-            data,
+struct ReadFileList<R>(R)
+where
+    R: Read;
+
+impl<R> TryFrom<ReadFileList<R>> for FileList
+where
+    R: Read,
+{
+    type Error = WoxError;
+
+    fn try_from(input: ReadFileList<R>) -> Result<Self, Self::Error> {
+        let mut list = HashMap::new();
+
+        for maybe_line in BufReader::new(input.0).lines() {
+            let line = maybe_line?;
+
+            if line.is_empty() {
+                continue;
+            }
+
+            let mut csv = line.split(|ch| ch == ',');
+
+            if let Some(name) = csv.next() {
+                if name.is_empty() {
+                    return Err(WoxError::Error(ErrorCode::FileName));
+                }
+
+                let mut entry = ListEntry::new(name.to_string());
+
+                if let Some(hash) = csv.next() {
+                    entry.expected_hash = Some(parse_u16_hex(hash)?);
+                }
+
+                if let Some(size) = csv.next() {
+                    entry.expected_size = Some(size.parse()?);
+                }
+
+                list.insert(compute_hash(name.as_bytes()), entry);
+            };
+        }
+
+        Ok(Self { list })
+    }
+}
+
+impl Default for FileList {
+    fn default() -> Self {
+        Self {
             list: HashMap::new(),
         }
     }
+}
 
-    fn parse_list(&mut self, data: Vec<u8>) -> Result<(), WoxError> {
-        data.split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .try_for_each(|line: &[u8]| -> Result<(), WoxError> {
-                let mut csv = line.split(|byte| *byte == b',');
-
-                if let Some(name) = csv.next() {
-                    if name.is_empty() {
-                        return Err(WoxError::Error(ErrorCode::FileName));
-                    }
-
-                    let utf8_name = str::from_utf8(name)?;
-                    let mut entry = ListEntry::new(utf8_name.to_string());
-
-                    if let Some(hash) = csv.next() {
-                        entry.expected_hash = Some(parse_u16_hex(str::from_utf8(hash)?)?);
-                    }
-
-                    if let Some(size) = csv.next() {
-                        entry.expected_size = Some(str::from_utf8(size)?.parse()?);
-                    }
-
-                    self.list.insert(compute_hash(name), entry);
-                };
-
-                Ok(())
-            })?;
-
-        Ok(())
+impl Contents {
+    fn new(data: Vec<u8>, list: FileList) -> Contents {
+        Contents { data, list }
     }
 
     fn find_entry(&self, hash: FileHash) -> Option<&ListEntry> {
-        self.list.get(&hash)
+        self.list.list.get(&hash)
     }
 
     fn entry_name(&self, entry: &TocEntry) -> String {
@@ -578,7 +601,7 @@ fn compute_hash(name: &[u8]) -> FileHash {
 fn extract_cc_file<A, S, L>(
     stdout: &mut S,
     archive_stream: &mut A,
-    mut list_stream: L,
+    list_stream: L,
     root_directory: &Path,
     optional_files: Option<Vec<&str>>,
     contents_crypt: Crypt,
@@ -591,11 +614,7 @@ where
     let mut data = Vec::<u8>::new();
     archive_stream.read_to_end(&mut data)?;
 
-    let mut contents = Contents::new(data);
-
-    let mut data = Vec::<u8>::new();
-    list_stream.read_to_end(&mut data)?;
-    contents.parse_list(data)?;
+    let contents = Contents::new(data, FileList::try_from(ReadFileList(list_stream))?);
 
     create_dir_all(root_directory)?;
 
@@ -699,7 +718,7 @@ fn create_cc_file(
         })?;
 
     let archive_files = u16::try_from(cache.len())?;
-    let mut contents = Contents::new(Vec::<u8>::with_capacity(archive_size));
+    let mut contents = Contents::new(Vec::<u8>::with_capacity(archive_size), FileList::default());
     let mut cursor = contents.write_cursor();
     let mut payload_offset = TOC_START + TOC_EACH_SIZE * archive_files as usize;
 
@@ -737,7 +756,7 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
     // Step 1: Load archives data from disk
     let contents = paths
         .iter()
-        .map(|path| Ok(Contents::new(fs::read(path)?)))
+        .map(|path| Ok(Contents::new(fs::read(path)?, FileList::default())))
         .collect::<Result<SmallVec<[Contents; 2]>, WoxError>>()?;
 
     // Step 2: If there's a difference in file count, then the archive are different
