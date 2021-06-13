@@ -3,6 +3,7 @@
 //! https://xeen.fandom.com/wiki/CC_File_Format
 
 use bit_vec::BitVec;
+use byteorder::{LittleEndian, ReadBytesExt};
 use clap::{
     App, Arg, ArgMatches, Error as ClapError,
     ErrorKind::{HelpDisplayed, VersionDisplayed},
@@ -18,7 +19,9 @@ use std::{
     fmt::{Display, Formatter},
     fs,
     fs::{create_dir_all, File},
-    io::{stderr, stdout, BufRead, BufReader, Cursor, Error as IoError, Read, Write},
+    io::{
+        stderr, stdout, BufRead, BufReader, Cursor, Error as IoError, Read, Seek, SeekFrom, Write,
+    },
     num::{ParseIntError, TryFromIntError},
     path::Path,
     process::exit,
@@ -134,7 +137,7 @@ enum Direction {
 
 struct ReadCursor<'a> {
     contents: &'a Contents,
-    offset: usize,
+    cursor: Cursor<&'a [u8]>,
     crypt: Option<Crypt>,
 }
 
@@ -251,16 +254,12 @@ impl Contents {
         }
     }
 
-    fn read_cursor_at(&self, offset: usize, crypt: Option<Crypt>) -> ReadCursor {
-        ReadCursor {
-            contents: self,
-            offset,
-            crypt,
-        }
+    fn read_cursor_at(&self, offset: u64, crypt: Option<Crypt>) -> Result<ReadCursor, IoError> {
+        ReadCursor::starting_from(self, offset, crypt)
     }
 
     fn read_cursor(&self) -> ReadCursor {
-        self.read_cursor_at(0, None)
+        ReadCursor::new(self, None)
     }
 
     fn write_cursor(&mut self) -> WriteCursor {
@@ -270,15 +269,15 @@ impl Contents {
         }
     }
 
-    fn file_count(&self) -> Result<FileCount, WoxError> {
-        self.read_cursor().read_u16()
+    fn file_count(&self) -> Result<FileCount, IoError> {
+        self.read_cursor().read_u16::<LittleEndian>()
     }
 
-    fn toc_iter(&self) -> Result<TocIter, WoxError> {
+    fn toc_iter(&self) -> Result<TocIter, IoError> {
         let mut cursor = self.read_cursor();
 
         // XXX: Remplace with self.file_count()
-        let total = cursor.read_u16()? as usize;
+        let total = cursor.read_u16::<LittleEndian>()? as usize;
 
         cursor.crypt = Some(Crypt::RotateAdd(ROTATE_ADD_INITIAL));
 
@@ -341,8 +340,12 @@ impl Contents {
     }
 
     fn fetch_payload(&self, entry: &TocEntry, crypt: Option<Crypt>) -> Result<Vec<u8>, WoxError> {
-        self.read_cursor_at(entry.offset as usize, crypt)
-            .read(entry.len as usize)
+        let mut payload = vec![0; entry.len as usize];
+
+        self.read_cursor_at(entry.offset as u64, crypt)?
+            .read_exact(&mut payload)?;
+
+        Ok(payload)
     }
 }
 
@@ -376,50 +379,43 @@ fn crypt(optional_crypt: &mut Option<Crypt>, direction: Direction, byte: u8) -> 
 }
 
 impl<'a> ReadCursor<'a> {
+    fn starting_from(
+        contents: &'a Contents,
+        offset: u64,
+        crypt: Option<Crypt>,
+    ) -> Result<Self, IoError> {
+        let mut cursor = Cursor::new(contents.data.as_slice());
+        cursor.seek(SeekFrom::Start(offset))?;
+
+        Ok(Self {
+            contents,
+            cursor,
+            crypt,
+        })
+    }
+
+    fn new(contents: &'a Contents, crypt: Option<Crypt>) -> Self {
+        Self {
+            contents,
+            cursor: Cursor::new(&contents.data),
+            crypt,
+        }
+    }
+
     fn contents(&self) -> &Contents {
         self.contents
     }
+}
 
-    fn read_u8(&mut self) -> Result<u8, WoxError> {
-        let len = self.contents.data.len();
-        if len <= self.offset {
-            Err(WoxError::Error(ErrorCode::EndOfFile(len, self.offset)))
-        } else {
-            let byte = self.contents.data[self.offset];
-            self.offset += 1;
+impl<'a> Read for ReadCursor<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        let bytes_read = self.cursor.read(buf)?;
 
-            Ok(crypt(&mut self.crypt, Direction::Read, byte))
-        }
-    }
+        buf[..bytes_read]
+            .iter_mut()
+            .for_each(|byte| *byte = crypt(&mut self.crypt, Direction::Read, *byte));
 
-    fn read_u16(&mut self) -> Result<u16, WoxError> {
-        Ok(u16::from_le_bytes([self.read_u8()?, self.read_u8()?]))
-    }
-
-    fn read_u24(&mut self) -> Result<u32, WoxError> {
-        Ok(u32::from_le_bytes([
-            self.read_u8()?,
-            self.read_u8()?,
-            self.read_u8()?,
-            0,
-        ]))
-    }
-
-    fn read(&mut self, size: usize) -> Result<Vec<u8>, WoxError> {
-        let len = self.contents.data.len();
-        let next_offset = self.offset + size;
-        if next_offset > len {
-            return Err(WoxError::Error(ErrorCode::EndOfFile(len, next_offset - 1)));
-        }
-
-        let decrypted = self.contents.data[self.offset..next_offset]
-            .iter()
-            .map(|i| crypt(&mut self.crypt, Direction::Read, *i))
-            .collect();
-
-        self.offset = next_offset;
-
-        Ok(decrypted)
+        Ok(bytes_read)
     }
 }
 
@@ -471,9 +467,9 @@ impl<'a> WriteCursor<'a> {
 impl TocEntry {
     fn new(cursor: &mut ReadCursor) -> Result<TocEntry, WoxError> {
         let entry = TocEntry {
-            id: cursor.read_u16()?,
-            offset: cursor.read_u24()?,
-            len: cursor.read_u16()?,
+            id: cursor.read_u16::<LittleEndian>()?,
+            offset: cursor.read_u24::<LittleEndian>()?,
+            len: cursor.read_u16::<LittleEndian>()?,
         };
 
         // Ensure that the padding byte is set to 0
@@ -773,7 +769,7 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
     let file_counts = contents
         .iter()
         .map(|content| content.file_count())
-        .collect::<Result<SmallVec<[FileSize; 2]>, WoxError>>()?;
+        .collect::<Result<SmallVec<[FileSize; 2]>, IoError>>()?;
 
     if file_counts[0] != file_counts[1] {
         return Err(WoxError::Error(ErrorCode::Compare(
