@@ -99,9 +99,9 @@ impl From<ClapError> for WoxError {
 
 const ROTATE_ADD_INITIAL: u8 = 0xac;
 
-#[derive(Copy, Clone)]
+// None for Crypt: Used for the initial 2 bytes of the file
+#[derive(Clone)]
 enum Crypt {
-    None,          // Used for the initial 2 bytes of the file
     RotateAdd(u8), // Used for the table of contents
     Xor,           // Used for the file contents
 }
@@ -135,12 +135,12 @@ enum Direction {
 struct ReadCursor<'a> {
     contents: &'a Contents,
     offset: usize,
-    crypt: Crypt,
+    crypt: Option<Crypt>,
 }
 
 struct WriteCursor<'a> {
     contents: &'a mut Contents,
-    crypt: Crypt,
+    crypt: Option<Crypt>,
 }
 
 #[derive(Copy, Clone)]
@@ -162,14 +162,14 @@ struct TocIter<'a> {
 
 struct PayloadIter<'a> {
     toc: TocIter<'a>,
-    contents_crypt: Crypt,
+    contents_crypt: Option<Crypt>,
 }
 
 struct PayloadBufferedIter<'a> {
     tocs: Vec<TocEntry>,
     idx: usize,
     contents: &'a Contents,
-    contents_crypt: Crypt,
+    contents_crypt: Option<Crypt>,
 }
 
 impl ListEntry {
@@ -251,7 +251,7 @@ impl Contents {
         }
     }
 
-    fn read_cursor_at(&self, offset: usize, crypt: Crypt) -> ReadCursor {
+    fn read_cursor_at(&self, offset: usize, crypt: Option<Crypt>) -> ReadCursor {
         ReadCursor {
             contents: self,
             offset,
@@ -260,13 +260,13 @@ impl Contents {
     }
 
     fn read_cursor(&self) -> ReadCursor {
-        self.read_cursor_at(0, Crypt::None)
+        self.read_cursor_at(0, None)
     }
 
     fn write_cursor(&mut self) -> WriteCursor {
         WriteCursor {
             contents: self,
-            crypt: Crypt::None,
+            crypt: None,
         }
     }
 
@@ -280,7 +280,7 @@ impl Contents {
         // XXX: Remplace with self.file_count()
         let total = cursor.read_u16()? as usize;
 
-        cursor.crypt = Crypt::RotateAdd(ROTATE_ADD_INITIAL);
+        cursor.crypt = Some(Crypt::RotateAdd(ROTATE_ADD_INITIAL));
 
         Ok(TocIter {
             cursor,
@@ -290,7 +290,7 @@ impl Contents {
         })
     }
 
-    fn payload_iter(&self, contents_crypt: Crypt) -> Result<PayloadIter, WoxError> {
+    fn payload_iter(&self, contents_crypt: Option<Crypt>) -> Result<PayloadIter, WoxError> {
         Ok(PayloadIter {
             toc: self.toc_iter()?,
             contents_crypt,
@@ -300,7 +300,7 @@ impl Contents {
     fn payload_filtered_ordered_iter(
         &self,
         hashes: &[FileHash],
-        contents_crypt: Crypt,
+        contents_crypt: Option<Crypt>,
     ) -> Result<PayloadBufferedIter, WoxError> {
         // Read the whole toc and save the entries we are interested for
         // XXX: This is suboptimal: if we found all the entries, we can stop reading the toc
@@ -340,32 +340,39 @@ impl Contents {
         })
     }
 
-    fn fetch_payload(&self, entry: &TocEntry, crypt: Crypt) -> Result<Vec<u8>, WoxError> {
+    fn fetch_payload(&self, entry: &TocEntry, crypt: Option<Crypt>) -> Result<Vec<u8>, WoxError> {
         self.read_cursor_at(entry.offset as usize, crypt)
             .read(entry.len as usize)
     }
 }
 
-fn crypt(mut crypt: &mut Crypt, direction: Direction, byte: u8) -> u8 {
-    const ROTATE: u32 = 6;
-    const ADD: u8 = 0x67;
+impl Crypt {
+    fn crypt_byte(&mut self, direction: Direction, byte: u8) -> u8 {
+        const ROTATE: u32 = 6;
+        const ADD: u8 = 0x67;
 
-    match (&direction, &mut crypt) {
-        (_, Crypt::None) => byte,
-        (Direction::Read, Crypt::RotateAdd(state)) => {
-            let decrypted = u8::wrapping_add(byte.rotate_right(ROTATE), *state);
-            *crypt = Crypt::RotateAdd(u8::wrapping_add(*state, ADD));
+        match (direction, self) {
+            (Direction::Read, Crypt::RotateAdd(ref mut state)) => {
+                let decrypted = u8::wrapping_add(byte.rotate_right(ROTATE), *state);
+                *state = u8::wrapping_add(*state, ADD);
 
-            decrypted
+                decrypted
+            }
+            (Direction::Write, Crypt::RotateAdd(ref mut state)) => {
+                let crypted = u8::wrapping_sub(byte, *state).rotate_left(ROTATE);
+                *state = u8::wrapping_add(*state, ADD);
+
+                crypted
+            }
+            (_, Crypt::Xor) => byte ^ 0x35,
         }
-        (Direction::Write, Crypt::RotateAdd(state)) => {
-            let crypted = u8::wrapping_sub(byte, *state).rotate_left(ROTATE);
-            *crypt = Crypt::RotateAdd(u8::wrapping_add(*state, ADD));
-
-            crypted
-        }
-        (_, Crypt::Xor) => byte ^ 0x35,
     }
+}
+
+fn crypt(optional_crypt: &mut Option<Crypt>, direction: Direction, byte: u8) -> u8 {
+    optional_crypt
+        .as_mut()
+        .map_or(byte, |crypt| crypt.crypt_byte(direction, byte))
 }
 
 impl<'a> ReadCursor<'a> {
@@ -526,7 +533,7 @@ impl<'a> Iterator for PayloadIter<'a> {
                 Ok(entry) => match self
                     .toc
                     .contents()
-                    .fetch_payload(&entry, self.contents_crypt)
+                    .fetch_payload(&entry, self.contents_crypt.clone())
                 {
                     Ok(decrypted) => Some(Ok((entry, decrypted))),
                     Err(err) => Some(Err(err)),
@@ -547,7 +554,10 @@ impl<'a> Iterator for PayloadBufferedIter<'a> {
             let toc = self.tocs[self.idx];
             self.idx += 1;
 
-            match self.contents.fetch_payload(&toc, self.contents_crypt) {
+            match self
+                .contents
+                .fetch_payload(&toc, self.contents_crypt.clone())
+            {
                 Ok(decrypted) => Some(Ok((toc, decrypted))),
                 Err(err) => Some(Err(err)),
             }
@@ -604,7 +614,7 @@ fn extract_cc_file<A, S, L>(
     list_stream: L,
     root_directory: &Path,
     optional_files: Option<Vec<&str>>,
-    contents_crypt: Crypt,
+    contents_crypt: Option<Crypt>,
 ) -> Result<(), WoxError>
 where
     A: Read,
@@ -660,7 +670,7 @@ struct FilePayload {
 fn create_cc_file(
     archive_path: &Path,
     root_directory: &Path,
-    contents_crypt: Crypt,
+    contents_crypt: Option<Crypt>,
 ) -> Result<(), WoxError> {
     const TOC_START: usize = 2;
     const TOC_EACH_SIZE: usize = 8; // sizeof(TocEntry) + 1
@@ -726,7 +736,7 @@ fn create_cc_file(
     cursor.write_u16(archive_files)?;
 
     // Step 2: Get ready and write the table of contents
-    cursor.crypt = Crypt::RotateAdd(ROTATE_ADD_INITIAL);
+    cursor.crypt = Some(Crypt::RotateAdd(ROTATE_ADD_INITIAL));
     cache.values_mut().try_for_each(|file_payload| {
         // Modify the value in the hash since we will use this information in step 3
         // XXX: Incorrect, offset is actually an u24...
@@ -751,7 +761,7 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
     type Toc = BTreeMap<FileHash, TocEntry>;
 
     // We don't care about the crypto used for the file contents, use the least expensive one
-    let contents_crypt = Crypt::None;
+    let contents_crypt = None;
 
     // Step 1: Load archives data from disk
     let contents = paths
@@ -808,8 +818,8 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
         .zip(tocs[1].values())
         .all(|(a_entry, b_entry)| {
             if let (Ok(a_payload), Ok(b_payload)) = (
-                contents[0].fetch_payload(&a_entry, contents_crypt),
-                contents[1].fetch_payload(&b_entry, contents_crypt),
+                contents[0].fetch_payload(&a_entry, contents_crypt.clone()),
+                contents[1].fetch_payload(&b_entry, contents_crypt.clone()),
             ) {
                 a_payload == b_payload
             } else {
@@ -870,9 +880,9 @@ impl Extract {
                 .values_of("file")
                 .map(|files_iter| files_iter.collect::<Vec<_>>()),
             if matches.is_present("disable-contents-crypt") {
-                Crypt::None
+                None
             } else {
-                Crypt::Xor
+                Some(Crypt::Xor)
             },
         )
     }
@@ -980,9 +990,9 @@ where
             Path::new(matches.value_of_os("archive").unwrap()),
             Path::new(matches.value_of_os("root").unwrap()),
             if matches.is_present("disable-contents-crypt") {
-                Crypt::None
+                None
             } else {
-                Crypt::Xor
+                Some(Crypt::Xor)
             },
         )
     }
@@ -1146,7 +1156,7 @@ mod tests {
         const PLAINTEXT: Buf = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
         const EXPECTED_CRYPT: Buf = [176, 159, 143, 126, 110, 93, 77, 60];
 
-        let mut state = Crypt::RotateAdd(ROTATE_ADD_INITIAL);
+        let mut state = Some(Crypt::RotateAdd(ROTATE_ADD_INITIAL));
         let crypted = PLAINTEXT
             .iter()
             .map(|byte| crypt(&mut state, Direction::Read, *byte))
@@ -1154,7 +1164,7 @@ mod tests {
 
         assert_eq!(&crypted[..], EXPECTED_CRYPT);
 
-        let mut state = Crypt::RotateAdd(ROTATE_ADD_INITIAL);
+        let mut state = Some(Crypt::RotateAdd(ROTATE_ADD_INITIAL));
         let decrypted = crypted
             .iter()
             .map(|byte| crypt(&mut state, Direction::Write, *byte))
