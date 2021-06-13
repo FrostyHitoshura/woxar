@@ -3,7 +3,7 @@
 //! https://xeen.fandom.com/wiki/CC_File_Format
 
 use bit_vec::BitVec;
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use clap::{
     App, Arg, ArgMatches, Error as ClapError,
     ErrorKind::{HelpDisplayed, VersionDisplayed},
@@ -45,7 +45,6 @@ fn parse_u16_hex(input: &str) -> Result<u16, ParseIntError> {
 
 #[derive(Debug)]
 enum ErrorCode {
-    EndOfFile(usize, usize),
     FileName,
     ReadToc,
     GenerateToc(String, FileHash),
@@ -142,7 +141,7 @@ struct ReadCursor<'a> {
 }
 
 struct WriteCursor<'a> {
-    contents: &'a mut Contents,
+    cursor: &'a mut Vec<u8>,
     crypt: Option<Crypt>,
 }
 
@@ -263,10 +262,7 @@ impl Contents {
     }
 
     fn write_cursor(&mut self) -> WriteCursor {
-        WriteCursor {
-            contents: self,
-            crypt: None,
-        }
+        WriteCursor::new(self, None)
     }
 
     fn file_count(&self) -> Result<FileCount, IoError> {
@@ -420,47 +416,28 @@ impl<'a> Read for ReadCursor<'a> {
 }
 
 impl<'a> WriteCursor<'a> {
-    fn write_u8(&mut self, byte: u8) -> Result<(), WoxError> {
-        let cap = self.contents.data.capacity();
-        let len = self.contents.data.len();
-        if len >= cap {
-            Err(WoxError::Error(ErrorCode::EndOfFile(cap, len)))
-        } else {
-            self.contents
-                .data
-                .push(crypt(&mut self.crypt, Direction::Write, byte));
-            Ok(())
+    fn new(contents: &'a mut Contents, crypt: Option<Crypt>) -> Self {
+        Self {
+            cursor: &mut contents.data,
+            crypt,
         }
     }
+}
 
-    fn write_u16(&mut self, byte: u16) -> Result<(), WoxError> {
-        // little endian
-        self.write_u8(byte as u8)?;
-        self.write_u8((byte >> 8) as u8)
-    }
-
-    fn write_u24(&mut self, byte: u32) -> Result<(), WoxError> {
-        // little endian
-        self.write_u8(byte as u8)?;
-        self.write_u8((byte >> 8) as u8)?;
-        self.write_u8((byte >> 16) as u8)
-    }
-
-    fn write(&mut self, data: &[u8]) -> Result<(), WoxError> {
-        let cap = self.contents.data.capacity();
-        let next_len = self.contents.data.len() + data.len();
-        if next_len > cap {
-            return Err(WoxError::Error(ErrorCode::EndOfFile(cap, next_len - 1)));
-        }
-
-        let crypted = data
+impl<'a> Write for WriteCursor<'a> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+        let crypted = buf
             .iter()
-            .map(|o| crypt(&mut self.crypt, Direction::Write, *o))
+            .map(|byte| crypt(&mut self.crypt, Direction::Write, *byte))
             .collect::<Vec<u8>>();
 
-        self.contents.data.extend_from_slice(&crypted);
+        self.cursor.write_all(&crypted)?;
 
-        Ok(())
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.cursor.flush()
     }
 }
 
@@ -480,11 +457,11 @@ impl TocEntry {
         }
     }
 
-    fn write(&self, cursor: &mut WriteCursor) -> Result<(), WoxError> {
-        cursor.write_u16(self.id)?;
-        cursor.write_u24(self.offset)?;
-        cursor.write_u16(self.len)?;
-        cursor.write_u8(0_u8)
+    fn write(&self, cursor: &mut WriteCursor) -> Result<(), IoError> {
+        cursor.write_u16::<LittleEndian>(self.id)?;
+        cursor.write_u24::<LittleEndian>(self.offset)?;
+        cursor.write_u16::<LittleEndian>(self.len)?;
+        cursor.write_u8(0)
     }
 }
 
@@ -567,14 +544,22 @@ impl Display for WoxError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             WoxError::Error(ours) => {
-                write!(f, "{}", match ours {
-                    ErrorCode::EndOfFile(len, offset) => format!("Premature end of file encountered, attempted to access offset {} while size is {}", offset, len),
-                    ErrorCode::FileName => "Invalid file name format".to_string(),
-                    ErrorCode::ReadToc => "Found invalid data in the table of contents".to_string(),
-                    ErrorCode::GenerateToc(file, hash) => format!("Can't encode file '{}' as hash {:#06x} is already in use", file, hash),
-                    ErrorCode::Race => "Hit a race condition".to_string(),
-                    ErrorCode::Compare(a, b, reason) => format!("Archives '{}' and '{}' differ: {}", a, b, reason),
-                })
+                write!(
+                    f,
+                    "{}",
+                    match ours {
+                        ErrorCode::FileName => "Invalid file name format".to_string(),
+                        ErrorCode::ReadToc =>
+                            "Found invalid data in the table of contents".to_string(),
+                        ErrorCode::GenerateToc(file, hash) => format!(
+                            "Can't encode file '{}' as hash {:#06x} is already in use",
+                            file, hash
+                        ),
+                        ErrorCode::Race => "Hit a race condition".to_string(),
+                        ErrorCode::Compare(a, b, reason) =>
+                            format!("Archives '{}' and '{}' differ: {}", a, b, reason),
+                    }
+                )
             }
             // XXX: Transform into generic match?
             WoxError::Utf8Error(err) => write!(f, "{}", err),
@@ -729,25 +714,27 @@ fn create_cc_file(
     let mut payload_offset = TOC_START + TOC_EACH_SIZE * archive_files as usize;
 
     // Step 1: Write the number of files in this archive
-    cursor.write_u16(archive_files)?;
+    cursor.write_u16::<LittleEndian>(archive_files)?;
 
     // Step 2: Get ready and write the table of contents
     cursor.crypt = Some(Crypt::RotateAdd(ROTATE_ADD_INITIAL));
-    cache.values_mut().try_for_each(|file_payload| {
-        // Modify the value in the hash since we will use this information in step 3
-        // XXX: Incorrect, offset is actually an u24...
-        file_payload.entry.offset = u32::try_from(payload_offset)?;
+    cache
+        .values_mut()
+        .try_for_each(|file_payload| -> Result<(), WoxError> {
+            // Modify the value in the hash since we will use this information in step 3
+            // XXX: Incorrect, offset is actually an u24...
+            file_payload.entry.offset = u32::try_from(payload_offset)?;
 
-        payload_offset += file_payload.payload.len();
+            payload_offset += file_payload.payload.len();
 
-        file_payload.entry.write(&mut cursor)
-    })?;
+            Ok(file_payload.entry.write(&mut cursor)?)
+        })?;
 
     // Step 3: Get ready and write all the contents of the archive
     cursor.crypt = contents_crypt;
     cache
         .values()
-        .try_for_each(|file_payload| cursor.write(&file_payload.payload))?;
+        .try_for_each(|file_payload| cursor.write_all(&file_payload.payload))?;
 
     // Step 4: Actually write the file on disk
     Ok(fs::write(archive_path, contents.data)?)
