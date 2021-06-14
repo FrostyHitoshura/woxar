@@ -140,8 +140,8 @@ struct ReadCursor<'a> {
     crypt: Option<Crypt>,
 }
 
-struct WriteCursor<'a> {
-    cursor: &'a mut Vec<u8>,
+struct Encrypt<S> {
+    sink: S,
     crypt: Option<Crypt>,
 }
 
@@ -259,10 +259,6 @@ impl Contents {
 
     fn read_cursor(&self) -> ReadCursor {
         ReadCursor::new(self, None)
-    }
-
-    fn write_cursor(&mut self) -> WriteCursor {
-        WriteCursor::new(self, None)
     }
 
     fn file_count(&self) -> Result<FileCount, IoError> {
@@ -415,29 +411,29 @@ impl<'a> Read for ReadCursor<'a> {
     }
 }
 
-impl<'a> WriteCursor<'a> {
-    fn new(contents: &'a mut Contents, crypt: Option<Crypt>) -> Self {
-        Self {
-            cursor: &mut contents.data,
-            crypt,
-        }
+impl<S> Encrypt<S> {
+    fn new(sink: S, crypt: Option<Crypt>) -> Self {
+        Self { sink, crypt }
     }
 }
 
-impl<'a> Write for WriteCursor<'a> {
+impl<S> Write for Encrypt<S>
+where
+    S: Write,
+{
     fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
         let crypted = buf
             .iter()
             .map(|byte| crypt(&mut self.crypt, Direction::Write, *byte))
             .collect::<Vec<u8>>();
 
-        self.cursor.write_all(&crypted)?;
+        self.sink.write_all(&crypted)?;
 
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> Result<(), IoError> {
-        self.cursor.flush()
+        self.sink.flush()
     }
 }
 
@@ -457,11 +453,14 @@ impl TocEntry {
         }
     }
 
-    fn write(&self, cursor: &mut WriteCursor) -> Result<(), IoError> {
-        cursor.write_u16::<LittleEndian>(self.id)?;
-        cursor.write_u24::<LittleEndian>(self.offset)?;
-        cursor.write_u16::<LittleEndian>(self.len)?;
-        cursor.write_u8(0)
+    fn write<S>(&self, sink: &mut S) -> Result<(), IoError>
+    where
+        S: Write,
+    {
+        sink.write_u16::<LittleEndian>(self.id)?;
+        sink.write_u24::<LittleEndian>(self.offset)?;
+        sink.write_u16::<LittleEndian>(self.len)?;
+        sink.write_u8(0)
     }
 }
 
@@ -709,15 +708,14 @@ fn create_cc_file(
         })?;
 
     let archive_files = u16::try_from(cache.len())?;
-    let mut contents = Contents::new(Vec::<u8>::with_capacity(archive_size), FileList::default());
-    let mut cursor = contents.write_cursor();
+    let mut encrypt = Encrypt::new(File::create(archive_path)?, None);
     let mut payload_offset = TOC_START + TOC_EACH_SIZE * archive_files as usize;
 
     // Step 1: Write the number of files in this archive
-    cursor.write_u16::<LittleEndian>(archive_files)?;
+    encrypt.write_u16::<LittleEndian>(archive_files)?;
 
     // Step 2: Get ready and write the table of contents
-    cursor.crypt = Some(Crypt::RotateAdd(ROTATE_ADD_INITIAL));
+    encrypt.crypt = Some(Crypt::RotateAdd(ROTATE_ADD_INITIAL));
     cache
         .values_mut()
         .try_for_each(|file_payload| -> Result<(), WoxError> {
@@ -727,17 +725,17 @@ fn create_cc_file(
 
             payload_offset += file_payload.payload.len();
 
-            Ok(file_payload.entry.write(&mut cursor)?)
+            Ok(file_payload.entry.write(&mut encrypt)?)
         })?;
 
     // Step 3: Get ready and write all the contents of the archive
-    cursor.crypt = contents_crypt;
+    encrypt.crypt = contents_crypt;
     cache
         .values()
-        .try_for_each(|file_payload| cursor.write_all(&file_payload.payload))?;
+        .try_for_each(|file_payload| encrypt.write_all(&file_payload.payload))?;
 
     // Step 4: Actually write the file on disk
-    Ok(fs::write(archive_path, contents.data)?)
+    Ok(encrypt.flush()?)
 }
 
 fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {

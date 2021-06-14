@@ -88,6 +88,7 @@ fi
 # Run unit tests and build a release binary that we will use below
 export RUST_BACKTRACE=1
 
+cargo clippy --all-targets
 cargo test
 cargo build --release
 
