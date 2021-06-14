@@ -1185,7 +1185,7 @@ mod tests {
         );
 
         if on_stdout {
-            assert!(stdout.len() > 0);
+            assert!(!stdout.is_empty());
         }
 
         assert!(stderr.is_empty());
