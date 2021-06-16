@@ -134,9 +134,8 @@ enum Direction {
     Write,
 }
 
-struct ReadCursor<'a> {
-    contents: &'a Contents,
-    cursor: Cursor<&'a [u8]>,
+struct Decrypt<S> {
+    cursor: S,
     crypt: Option<Crypt>,
 }
 
@@ -154,7 +153,7 @@ struct TocEntry {
 }
 
 struct TocIter<'a> {
-    cursor: ReadCursor<'a>,
+    cursor: Decrypt<Cursor<&'a [u8]>>,
     idx: usize,
     total: usize,
 
@@ -165,6 +164,7 @@ struct TocIter<'a> {
 struct PayloadIter<'a> {
     toc: TocIter<'a>,
     contents_crypt: Option<Crypt>,
+    contents: &'a Contents,
 }
 
 struct PayloadBufferedIter<'a> {
@@ -253,12 +253,18 @@ impl Contents {
         }
     }
 
-    fn read_cursor_at(&self, offset: u64, crypt: Option<Crypt>) -> Result<ReadCursor, IoError> {
-        ReadCursor::starting_from(self, offset, crypt)
+    fn read_cursor_at(
+        &self,
+        offset: u64,
+        crypt: Option<Crypt>,
+    ) -> Result<Decrypt<Cursor<&[u8]>>, IoError> {
+        let mut decrypt = Decrypt::new(Cursor::new(self.data.as_slice()), crypt);
+        decrypt.seek(SeekFrom::Start(offset))?;
+        Ok(decrypt)
     }
 
-    fn read_cursor(&self) -> ReadCursor {
-        ReadCursor::new(self, None)
+    fn read_cursor(&self) -> Decrypt<Cursor<&[u8]>> {
+        Decrypt::new(Cursor::new(&self.data), None)
     }
 
     fn file_count(&self) -> Result<FileCount, IoError> {
@@ -285,6 +291,7 @@ impl Contents {
         Ok(PayloadIter {
             toc: self.toc_iter()?,
             contents_crypt,
+            contents: self,
         })
     }
 
@@ -370,36 +377,16 @@ fn crypt(optional_crypt: &mut Option<Crypt>, direction: Direction, byte: u8) -> 
         .map_or(byte, |crypt| crypt.crypt_byte(direction, byte))
 }
 
-impl<'a> ReadCursor<'a> {
-    fn starting_from(
-        contents: &'a Contents,
-        offset: u64,
-        crypt: Option<Crypt>,
-    ) -> Result<Self, IoError> {
-        let mut cursor = Cursor::new(contents.data.as_slice());
-        cursor.seek(SeekFrom::Start(offset))?;
-
-        Ok(Self {
-            contents,
-            cursor,
-            crypt,
-        })
-    }
-
-    fn new(contents: &'a Contents, crypt: Option<Crypt>) -> Self {
-        Self {
-            contents,
-            cursor: Cursor::new(&contents.data),
-            crypt,
-        }
-    }
-
-    fn contents(&self) -> &Contents {
-        self.contents
+impl<S> Decrypt<S> {
+    fn new(cursor: S, crypt: Option<Crypt>) -> Self {
+        Self { cursor, crypt }
     }
 }
 
-impl<'a> Read for ReadCursor<'a> {
+impl<S> Read for Decrypt<S>
+where
+    S: Read,
+{
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
         let bytes_read = self.cursor.read(buf)?;
 
@@ -408,6 +395,15 @@ impl<'a> Read for ReadCursor<'a> {
             .for_each(|byte| *byte = crypt(&mut self.crypt, Direction::Read, *byte));
 
         Ok(bytes_read)
+    }
+}
+
+impl<S> Seek for Decrypt<S>
+where
+    S: Seek,
+{
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64, IoError> {
+        self.cursor.seek(pos)
     }
 }
 
@@ -438,15 +434,18 @@ where
 }
 
 impl TocEntry {
-    fn new(cursor: &mut ReadCursor) -> Result<TocEntry, WoxError> {
+    fn new<S>(source: &mut S) -> Result<TocEntry, WoxError>
+    where
+        S: Read,
+    {
         let entry = TocEntry {
-            id: cursor.read_u16::<LittleEndian>()?,
-            offset: cursor.read_u24::<LittleEndian>()?,
-            len: cursor.read_u16::<LittleEndian>()?,
+            id: source.read_u16::<LittleEndian>()?,
+            offset: source.read_u24::<LittleEndian>()?,
+            len: source.read_u16::<LittleEndian>()?,
         };
 
         // Ensure that the padding byte is set to 0
-        if cursor.read_u8()? != 0 {
+        if source.read_u8()? != 0 {
             Err(WoxError::Error(ErrorCode::ReadToc))
         } else {
             Ok(entry)
@@ -461,12 +460,6 @@ impl TocEntry {
         sink.write_u24::<LittleEndian>(self.offset)?;
         sink.write_u16::<LittleEndian>(self.len)?;
         sink.write_u8(0)
-    }
-}
-
-impl<'a> TocIter<'a> {
-    fn contents(&self) -> &Contents {
-        self.cursor.contents()
     }
 }
 
@@ -503,8 +496,7 @@ impl<'a> Iterator for PayloadIter<'a> {
         if let Some(entry_result) = self.toc.next() {
             match entry_result {
                 Ok(entry) => match self
-                    .toc
-                    .contents()
+                    .contents
                     .fetch_payload(&entry, self.contents_crypt.clone())
                 {
                     Ok(decrypted) => Some(Ok((entry, decrypted))),
