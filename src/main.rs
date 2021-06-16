@@ -2,6 +2,7 @@
 //!
 //! https://xeen.fandom.com/wiki/CC_File_Format
 
+use anyhow::{anyhow, bail, ensure};
 use bit_vec::BitVec;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use clap::{
@@ -13,22 +14,19 @@ use smallvec::SmallVec;
 use std::{
     collections::{btree_map::Entry::Vacant, BTreeMap, HashMap},
     convert::TryFrom,
-    env, error,
+    env,
     ffi::OsStr,
-    fmt,
-    fmt::{Display, Formatter},
     fs,
     fs::{create_dir_all, File},
     io::{
         stderr, stdout, BufRead, BufReader, Cursor, Error as IoError, Read, Seek, SeekFrom, Write,
     },
-    num::{ParseIntError, TryFromIntError},
+    num::ParseIntError,
     path::Path,
     process::exit,
-    str,
-    str::Utf8Error,
-    u16,
+    str, u16,
 };
+use thiserror::Error;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
@@ -43,60 +41,38 @@ fn parse_u16_hex(input: &str) -> Result<u16, ParseIntError> {
     u16::from_str_radix(&input[starting_offset..], 16)
 }
 
-#[derive(Debug)]
-enum ErrorCode {
-    FileName,
-    ReadToc,
-    GenerateToc(String, FileHash),
-    Race,
-    Compare(String, String, String),
+#[derive(Debug, Error)]
+enum CompareReasonError {
+    #[error("The former has {0} file(s) while the latter has {1} file(s)")]
+    DifferentFileCount(usize, usize),
+    #[error("The table of contents differs")]
+    TocDiffers,
+    #[error("One or more file content differs")]
+    ContentDiffers,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 enum WoxError {
-    Error(ErrorCode),
-    Utf8Error(Utf8Error),
-    ParseIntError(ParseIntError),
-    IoError(IoError),
-    TryFromIntError(TryFromIntError),
-    ClapError(ClapError),
-    Generic(String),
-}
-
-impl From<ErrorCode> for WoxError {
-    fn from(error: ErrorCode) -> Self {
-        WoxError::Error(error)
-    }
-}
-
-impl From<Utf8Error> for WoxError {
-    fn from(error: Utf8Error) -> Self {
-        WoxError::Utf8Error(error)
-    }
-}
-
-impl From<ParseIntError> for WoxError {
-    fn from(error: ParseIntError) -> Self {
-        WoxError::ParseIntError(error)
-    }
-}
-
-impl From<IoError> for WoxError {
-    fn from(error: IoError) -> Self {
-        WoxError::IoError(error)
-    }
-}
-
-impl From<TryFromIntError> for WoxError {
-    fn from(error: TryFromIntError) -> Self {
-        WoxError::TryFromIntError(error)
-    }
-}
-
-impl From<ClapError> for WoxError {
-    fn from(error: ClapError) -> Self {
-        WoxError::ClapError(error)
-    }
+    #[error("Invalid file name format")]
+    FileName,
+    #[error("Found invalid data in the table of contents")]
+    ReadToc,
+    #[error("Can't encode file '{0}' as hash {1:#06x} is already in use")]
+    GenerateToc(String, FileHash),
+    #[error("Hit a race condition")]
+    Race,
+    #[error("Archives '{a}' and '{b}' differ: {reason}")]
+    Compare {
+        a: String,
+        b: String,
+        reason: CompareReasonError,
+    },
+    #[error("Failed to find file hash {0} in archive")]
+    NoHash(FileHash),
+    #[error("Requires 2 or more archives to compare")]
+    Requires2PlusFiles,
+    #[error("No subcommand provided. Run '{0} help' for details.")]
+    NoSubcommand(String),
 }
 
 const ROTATE_ADD_INITIAL: u8 = 0xac;
@@ -192,7 +168,7 @@ impl<R> TryFrom<ReadFileList<R>> for FileList
 where
     R: Read,
 {
-    type Error = WoxError;
+    type Error = anyhow::Error;
 
     fn try_from(input: ReadFileList<R>) -> Result<Self, Self::Error> {
         let mut list = HashMap::new();
@@ -207,9 +183,7 @@ where
             let mut csv = line.split(|ch| ch == ',');
 
             if let Some(name) = csv.next() {
-                if name.is_empty() {
-                    return Err(WoxError::Error(ErrorCode::FileName));
-                }
+                ensure!(!name.is_empty(), WoxError::FileName);
 
                 let mut entry = ListEntry::new(name.to_string());
 
@@ -287,7 +261,7 @@ impl Contents {
         })
     }
 
-    fn payload_iter(&self, contents_crypt: Option<Crypt>) -> Result<PayloadIter, WoxError> {
+    fn payload_iter(&self, contents_crypt: Option<Crypt>) -> Result<PayloadIter, anyhow::Error> {
         Ok(PayloadIter {
             toc: self.toc_iter()?,
             contents_crypt,
@@ -299,7 +273,7 @@ impl Contents {
         &self,
         hashes: &[FileHash],
         contents_crypt: Option<Crypt>,
-    ) -> Result<PayloadBufferedIter, WoxError> {
+    ) -> Result<PayloadBufferedIter, anyhow::Error> {
         // Read the whole toc and save the entries we are interested for
         // XXX: This is suboptimal: if we found all the entries, we can stop reading the toc
         // XXX: We clone TocEntry 2 times in this function, looks excessive
@@ -322,10 +296,7 @@ impl Contents {
                     Ok(*entry)
                 } else {
                     // XXX: Improve error message
-                    Err(WoxError::Generic(format!(
-                        "Failed to find file hash {} in archive",
-                        hashes[idx]
-                    )))
+                    Err(WoxError::NoHash(hashes[idx]))
                 }
             })
             .collect::<Result<Vec<TocEntry>, WoxError>>()?;
@@ -338,7 +309,11 @@ impl Contents {
         })
     }
 
-    fn fetch_payload(&self, entry: &TocEntry, crypt: Option<Crypt>) -> Result<Vec<u8>, WoxError> {
+    fn fetch_payload(
+        &self,
+        entry: &TocEntry,
+        crypt: Option<Crypt>,
+    ) -> Result<Vec<u8>, anyhow::Error> {
         let mut payload = vec![0; entry.len as usize];
 
         self.read_cursor_at(entry.offset as u64, crypt)?
@@ -434,7 +409,7 @@ where
 }
 
 impl TocEntry {
-    fn new<S>(source: &mut S) -> Result<TocEntry, WoxError>
+    fn new<S>(source: &mut S) -> Result<TocEntry, anyhow::Error>
     where
         S: Read,
     {
@@ -446,7 +421,7 @@ impl TocEntry {
 
         // Ensure that the padding byte is set to 0
         if source.read_u8()? != 0 {
-            Err(WoxError::Error(ErrorCode::ReadToc))
+            bail!(WoxError::ReadToc)
         } else {
             Ok(entry)
         }
@@ -464,7 +439,7 @@ impl TocEntry {
 }
 
 impl<'a> Iterator for TocIter<'a> {
-    type Item = Result<TocEntry, WoxError>;
+    type Item = Result<TocEntry, anyhow::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.idx += 1;
@@ -475,12 +450,12 @@ impl<'a> Iterator for TocIter<'a> {
                 Ok(entry) => {
                     let bit = entry.id as usize;
 
-                    if self.verify[bit] {
-                        Some(Err(WoxError::Error(ErrorCode::ReadToc)))
+                    Some(if self.verify[bit] {
+                        Err(anyhow!(WoxError::ReadToc))
                     } else {
                         self.verify.set(bit, true);
-                        Some(Ok(entry))
-                    }
+                        Ok(entry)
+                    })
                 }
             }
         } else {
@@ -490,20 +465,20 @@ impl<'a> Iterator for TocIter<'a> {
 }
 
 impl<'a> Iterator for PayloadIter<'a> {
-    type Item = Result<(TocEntry, Vec<u8>), WoxError>;
+    type Item = Result<(TocEntry, Vec<u8>), anyhow::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(entry_result) = self.toc.next() {
-            match entry_result {
+            Some(match entry_result {
                 Ok(entry) => match self
                     .contents
                     .fetch_payload(&entry, self.contents_crypt.clone())
                 {
-                    Ok(decrypted) => Some(Ok((entry, decrypted))),
-                    Err(err) => Some(Err(err)),
+                    Ok(decrypted) => Ok((entry, decrypted)),
+                    Err(err) => Err(err),
                 },
-                Err(err) => Some(Err(err)),
-            }
+                Err(err) => Err(err),
+            })
         } else {
             None
         }
@@ -511,61 +486,25 @@ impl<'a> Iterator for PayloadIter<'a> {
 }
 
 impl<'a> Iterator for PayloadBufferedIter<'a> {
-    type Item = Result<(TocEntry, Vec<u8>), WoxError>;
+    type Item = Result<(TocEntry, Vec<u8>), anyhow::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx < self.tocs.len() {
             let toc = self.tocs[self.idx];
             self.idx += 1;
 
-            match self
-                .contents
-                .fetch_payload(&toc, self.contents_crypt.clone())
-            {
-                Ok(decrypted) => Some(Ok((toc, decrypted))),
-                Err(err) => Some(Err(err)),
-            }
+            Some(
+                match self
+                    .contents
+                    .fetch_payload(&toc, self.contents_crypt.clone())
+                {
+                    Ok(decrypted) => Ok((toc, decrypted)),
+                    Err(err) => Err(err),
+                },
+            )
         } else {
             None
         }
-    }
-}
-
-impl Display for WoxError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            WoxError::Error(ours) => {
-                write!(
-                    f,
-                    "{}",
-                    match ours {
-                        ErrorCode::FileName => "Invalid file name format".to_string(),
-                        ErrorCode::ReadToc =>
-                            "Found invalid data in the table of contents".to_string(),
-                        ErrorCode::GenerateToc(file, hash) => format!(
-                            "Can't encode file '{}' as hash {:#06x} is already in use",
-                            file, hash
-                        ),
-                        ErrorCode::Race => "Hit a race condition".to_string(),
-                        ErrorCode::Compare(a, b, reason) =>
-                            format!("Archives '{}' and '{}' differ: {}", a, b, reason),
-                    }
-                )
-            }
-            // XXX: Transform into generic match?
-            WoxError::Utf8Error(err) => write!(f, "{}", err),
-            WoxError::ParseIntError(err) => write!(f, "{}", err),
-            WoxError::IoError(err) => write!(f, "{}", err),
-            WoxError::TryFromIntError(err) => write!(f, "{}", err),
-            WoxError::ClapError(err) => write!(f, "{}", err),
-            WoxError::Generic(err) => write!(f, "{}", err),
-        }
-    }
-}
-
-impl error::Error for WoxError {
-    fn description(&self) -> &str {
-        "World of Xeen Archiver error"
     }
 }
 
@@ -587,7 +526,7 @@ fn extract_cc_file<A, S, L>(
     root_directory: &Path,
     optional_files: Option<Vec<&str>>,
     contents_crypt: Option<Crypt>,
-) -> Result<(), WoxError>
+) -> Result<(), anyhow::Error>
 where
     A: Read,
     S: Write,
@@ -613,7 +552,7 @@ where
         contents
             .payload_filtered_ordered_iter(&hashes, contents_crypt)?
             .try_for_each(
-                |payload_result: Result<(TocEntry, Vec<u8>), WoxError>| -> Result<(), WoxError> {
+                |payload_result: Result<(TocEntry, Vec<u8>), anyhow::Error>| -> Result<(), anyhow::Error> {
                     let (_entry, contents) = payload_result?;
                     stdout.write_all(&contents)?;
                     Ok(())
@@ -622,7 +561,7 @@ where
     } else {
         // Extract all files arm: writing order isn't important
         contents.payload_iter(contents_crypt)?.try_for_each(
-            |payload_result: Result<(TocEntry, Vec<u8>), WoxError>| -> Result<(), WoxError> {
+            |payload_result: Result<(TocEntry, Vec<u8>), anyhow::Error>| -> Result<(), anyhow::Error> {
                 let payload = payload_result?;
                 fs::write(
                     root_directory.join(contents.entry_name(&payload.0)),
@@ -643,7 +582,7 @@ fn create_cc_file(
     archive_path: &Path,
     root_directory: &Path,
     contents_crypt: Option<Crypt>,
-) -> Result<(), WoxError> {
+) -> Result<(), anyhow::Error> {
     const TOC_START: usize = 2;
     const TOC_EACH_SIZE: usize = 8; // sizeof(TocEntry) + 1
     let mut cache: BTreeMap<FileHash, FilePayload> = BTreeMap::new();
@@ -653,7 +592,7 @@ fn create_cc_file(
 
     root_directory
         .read_dir()?
-        .try_for_each(|dir_entry_result| -> Result<(), WoxError> {
+        .try_for_each(|dir_entry_result| -> Result<(), anyhow::Error> {
             let dir_entry = dir_entry_result?;
 
             if let Some(path) = dir_entry.file_name().to_str() {
@@ -686,16 +625,13 @@ fn create_cc_file(
                         Ok(())
                     } else {
                         // Race condition between readdir and when we actually read the file?
-                        Err(WoxError::Error(ErrorCode::Race))
+                        Err(anyhow!(WoxError::Race))
                     }
                 } else {
-                    Err(WoxError::Error(ErrorCode::GenerateToc(
-                        path.to_string(),
-                        toc.id,
-                    )))
+                    Err(anyhow!(WoxError::GenerateToc(path.to_string(), toc.id)))
                 }
             } else {
-                Err(WoxError::Error(ErrorCode::FileName))
+                Err(anyhow!(WoxError::FileName))
             }
         })?;
 
@@ -710,7 +646,7 @@ fn create_cc_file(
     encrypt.crypt = Some(Crypt::RotateAdd(ROTATE_ADD_INITIAL));
     cache
         .values_mut()
-        .try_for_each(|file_payload| -> Result<(), WoxError> {
+        .try_for_each(|file_payload| -> Result<(), anyhow::Error> {
             // Modify the value in the hash since we will use this information in step 3
             // XXX: Incorrect, offset is actually an u24...
             file_payload.entry.offset = u32::try_from(payload_offset)?;
@@ -730,7 +666,7 @@ fn create_cc_file(
     Ok(encrypt.flush()?)
 }
 
-fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
+fn compare_cc_files(paths: [&Path; 2]) -> Result<(), anyhow::Error> {
     type Toc = BTreeMap<FileHash, TocEntry>;
 
     // We don't care about the crypto used for the file contents, use the least expensive one
@@ -740,7 +676,7 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
     let contents = paths
         .iter()
         .map(|path| Ok(Contents::new(fs::read(path)?, FileList::default())))
-        .collect::<Result<SmallVec<[Contents; 2]>, WoxError>>()?;
+        .collect::<Result<SmallVec<[Contents; 2]>, anyhow::Error>>()?;
 
     // Step 2: If there's a difference in file count, then the archive are different
     let file_counts = contents
@@ -748,16 +684,17 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
         .map(|content| content.file_count())
         .collect::<Result<SmallVec<[FileSize; 2]>, IoError>>()?;
 
-    if file_counts[0] != file_counts[1] {
-        return Err(WoxError::Error(ErrorCode::Compare(
-            paths[0].to_str().unwrap().to_string(),
-            paths[1].to_str().unwrap().to_string(),
-            format!(
-                "The former has {} file(s) while the latter has {} file(s)",
-                file_counts[0], file_counts[1]
+    ensure!(
+        file_counts[0] == file_counts[1],
+        WoxError::Compare {
+            a: paths[0].to_str().unwrap().to_string(),
+            b: paths[1].to_str().unwrap().to_string(),
+            reason: CompareReasonError::DifferentFileCount(
+                file_counts[0].into(),
+                file_counts[1].into(),
             ),
-        )));
-    }
+        }
+    );
 
     let tocs = contents
         .iter()
@@ -768,9 +705,9 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
                     Ok(toc) => Ok((toc.id, toc)),
                     Err(err) => Err(err),
                 })
-                .collect::<Result<Toc, WoxError>>()
+                .collect::<Result<Toc, anyhow::Error>>()
         })
-        .collect::<Result<SmallVec<[Toc; 2]>, WoxError>>()?;
+        .collect::<Result<SmallVec<[Toc; 2]>, anyhow::Error>>()?;
 
     // Step 3: If the TOC is different, then the archives are different.
     if !tocs[0]
@@ -778,11 +715,11 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
         .zip(tocs[1].values())
         .all(|(a_entry, b_entry)| a_entry.id == b_entry.id && a_entry.len == b_entry.len)
     {
-        return Err(WoxError::Error(ErrorCode::Compare(
-            paths[0].to_str().unwrap().to_string(),
-            paths[1].to_str().unwrap().to_string(),
-            "The table of contents differ".into(),
-        )));
+        bail!(WoxError::Compare {
+            a: paths[0].to_str().unwrap().to_string(),
+            b: paths[1].to_str().unwrap().to_string(),
+            reason: CompareReasonError::TocDiffers,
+        });
     }
 
     // Step 4: Last and more expensive check: make sure that the file contents is the same
@@ -803,11 +740,11 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), WoxError> {
     {
         Ok(())
     } else {
-        Err(WoxError::Error(ErrorCode::Compare(
-            paths[0].to_str().unwrap().to_string(),
-            paths[1].to_str().unwrap().to_string(),
-            "One or mode file content differs".into(),
-        )))
+        bail!(WoxError::Compare {
+            a: paths[0].to_str().unwrap().to_string(),
+            b: paths[1].to_str().unwrap().to_string(),
+            reason: CompareReasonError::ContentDiffers,
+        })
     }
 }
 
@@ -817,7 +754,7 @@ where
 {
     fn name(&self) -> &'static str;
     fn subcommand(&self) -> App;
-    fn execute(&self, args: &ArgMatches, stdout: &mut S) -> Result<(), WoxError>;
+    fn execute(&self, args: &ArgMatches, stdout: &mut S) -> Result<(), anyhow::Error>;
 }
 
 fn new_subcommand<'a>(name: &'a str, about: &'a str) -> App<'a, 'a> {
@@ -835,7 +772,7 @@ impl Extract {
         matches: &ArgMatches,
         stdout: &mut S,
         file_list: L,
-    ) -> Result<(), WoxError>
+    ) -> Result<(), anyhow::Error>
     where
         S: Write,
         L: Read,
@@ -909,7 +846,7 @@ where
             )
     }
 
-    fn execute(&self, matches: &ArgMatches, stdout: &mut S) -> Result<(), WoxError> {
+    fn execute(&self, matches: &ArgMatches, stdout: &mut S) -> Result<(), anyhow::Error> {
         if let Some(fl) = matches.value_of_os("fl") {
             self.execute_with_file_list(matches, stdout, &mut File::open(fl)?)
         } else {
@@ -958,7 +895,7 @@ where
         )
     }
 
-    fn execute(&self, matches: &ArgMatches, _stdout: &mut S) -> Result<(), WoxError> {
+    fn execute(&self, matches: &ArgMatches, _stdout: &mut S) -> Result<(), anyhow::Error> {
         create_cc_file(
             Path::new(matches.value_of_os("archive").unwrap()),
             Path::new(matches.value_of_os("root").unwrap()),
@@ -986,7 +923,7 @@ where
             .arg(Arg::with_name("archives").multiple(true))
     }
 
-    fn execute(&self, matches: &ArgMatches, _stdout: &mut S) -> Result<(), WoxError> {
+    fn execute(&self, matches: &ArgMatches, _stdout: &mut S) -> Result<(), anyhow::Error> {
         let mut iter = matches.values_of("archives").unwrap();
         let first = iter.next();
         let second = iter.next();
@@ -999,9 +936,7 @@ where
         if let (Some(first), Some(second)) = (first, second) {
             compare_cc_files([Path::new(first), Path::new(second)])
         } else {
-            Err(WoxError::Generic(
-                "Requires 2 or more archives to compare".into(),
-            ))
+            bail!(WoxError::Requires2PlusFiles)
         }
     }
 }
@@ -1024,7 +959,7 @@ where
         .arg(Arg::with_name("name").required(true))
     }
 
-    fn execute(&self, matches: &ArgMatches, stdout: &mut S) -> Result<(), WoxError> {
+    fn execute(&self, matches: &ArgMatches, stdout: &mut S) -> Result<(), anyhow::Error> {
         Ok(writeln!(
             stdout,
             "{}",
@@ -1045,7 +980,7 @@ where
     ]
 }
 
-fn exec_cmdline<S>(args: &[String], stdout: &mut S) -> Result<(), WoxError>
+fn exec_cmdline<S>(args: &[String], stdout: &mut S) -> Result<(), anyhow::Error>
 where
     S: Write,
 {
@@ -1069,10 +1004,7 @@ where
         stdout.flush()?;
         Ok(())
     } else {
-        return Err(WoxError::Generic(format!(
-            "No subcommand provided. Run '{} help' for details.",
-            args[0]
-        )));
+        bail!(WoxError::NoSubcommand(args[0].clone()))
     }
 }
 
@@ -1082,14 +1014,14 @@ where
     E: Write,
 {
     if let Err(err) = exec_cmdline(args, stdout) {
-        match err {
-            WoxError::ClapError(clap_err)
-                if clap_err.kind == HelpDisplayed || clap_err.kind == VersionDisplayed =>
+        match err.downcast_ref::<ClapError>() {
+            Some(ClapError { kind, message, .. })
+                if matches!(*kind, HelpDisplayed | VersionDisplayed) =>
             {
-                writeln!(stdout, "{}", clap_err.message).unwrap();
+                writeln!(stdout, "{}", message).unwrap();
                 true
             }
-            err => {
+            _ => {
                 writeln!(
                     stderr,
                     "{}: ERROR: {}",
@@ -1171,10 +1103,11 @@ mod tests {
 
         cmdline.push(arg.into());
 
-        assert_eq!(
-            exec_cmdline_manage_errors(&cmdline, &mut stdout, &mut stderr),
-            true
-        );
+        assert!(exec_cmdline_manage_errors(
+            &cmdline,
+            &mut stdout,
+            &mut stderr
+        ));
 
         if on_stdout {
             assert!(!stdout.is_empty());
