@@ -445,19 +445,16 @@ impl<'a> Iterator for TocIter<'a> {
         self.idx += 1;
 
         if self.idx <= self.total {
-            match TocEntry::new(&mut self.cursor) {
-                Err(err) => Some(Err(err)),
-                Ok(entry) => {
-                    let bit = entry.id as usize;
+            Some(TocEntry::new(&mut self.cursor).and_then(|entry| {
+                let bit = entry.id as usize;
 
-                    Some(if self.verify[bit] {
-                        Err(anyhow!(WoxError::ReadToc))
-                    } else {
-                        self.verify.set(bit, true);
-                        Ok(entry)
-                    })
+                if self.verify[bit] {
+                    Err(anyhow!(WoxError::ReadToc))
+                } else {
+                    self.verify.set(bit, true);
+                    Ok(entry)
                 }
-            }
+            }))
         } else {
             None
         }
@@ -468,20 +465,13 @@ impl<'a> Iterator for PayloadIter<'a> {
     type Item = Result<(TocEntry, Vec<u8>), anyhow::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(entry_result) = self.toc.next() {
-            Some(match entry_result {
-                Ok(entry) => match self
-                    .contents
+        self.toc.next().map(|entry_result| {
+            entry_result.and_then(|entry| {
+                self.contents
                     .fetch_payload(&entry, self.contents_crypt.clone())
-                {
-                    Ok(decrypted) => Ok((entry, decrypted)),
-                    Err(err) => Err(err),
-                },
-                Err(err) => Err(err),
+                    .map(|decrypted| (entry, decrypted))
             })
-        } else {
-            None
-        }
+        })
     }
 }
 
@@ -494,13 +484,9 @@ impl<'a> Iterator for PayloadBufferedIter<'a> {
             self.idx += 1;
 
             Some(
-                match self
-                    .contents
+                self.contents
                     .fetch_payload(&toc, self.contents_crypt.clone())
-                {
-                    Ok(decrypted) => Ok((toc, decrypted)),
-                    Err(err) => Err(err),
-                },
+                    .map(|decrypted| (toc, decrypted)),
             )
         } else {
             None
@@ -701,10 +687,7 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), anyhow::Error> {
         .map(|content| {
             content
                 .toc_iter()?
-                .map(|toc_result| match toc_result {
-                    Ok(toc) => Ok((toc.id, toc)),
-                    Err(err) => Err(err),
-                })
+                .map(|toc_result| toc_result.map(|toc| (toc.id, toc)))
                 .collect::<Result<Toc, anyhow::Error>>()
         })
         .collect::<Result<SmallVec<[Toc; 2]>, anyhow::Error>>()?;
