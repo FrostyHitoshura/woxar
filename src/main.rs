@@ -16,6 +16,7 @@ use std::{
     convert::TryFrom,
     env,
     ffi::OsStr,
+    fmt::Display,
     fs,
     fs::{create_dir_all, File},
     io::{
@@ -71,8 +72,8 @@ enum WoxError {
     NoHash(FileHash),
     #[error("Requires 2 or more archives to compare")]
     Requires2PlusFiles,
-    #[error("No subcommand provided. Run '{0} help' for details.")]
-    NoSubcommand(String),
+    #[error("No subcommand provided")]
+    NoSubcommand,
 }
 
 const ROTATE_ADD_INITIAL: u8 = 0xac;
@@ -510,7 +511,7 @@ fn extract_cc_file<A, S, L>(
     archive_stream: &mut A,
     list_stream: L,
     root_directory: &Path,
-    optional_files: Option<Vec<&str>>,
+    hashes_to_extract: &[FileHash],
     contents_crypt: Option<Crypt>,
 ) -> Result<(), anyhow::Error>
 where
@@ -525,18 +526,11 @@ where
 
     create_dir_all(root_directory)?;
 
-    if let Some(hashes) = optional_files.map(|files| {
-        files
-            .iter()
-            .map(|file|
-                // If it's a number, it's already a hash and use it as is
-                file.parse::<u16>().unwrap_or_else(|_| compute_hash(file.as_bytes())))
-            .collect::<Vec<_>>()
-    }) {
+    if !hashes_to_extract.is_empty() {
         // Extract specific files arm: writing order is important to respect the order the user set
         // by the user on the command line
         contents
-            .payload_filtered_ordered_iter(&hashes, contents_crypt)?
+            .payload_filtered_ordered_iter(&hashes_to_extract, contents_crypt)?
             .try_for_each(
                 |payload_result: Result<(TocEntry, Vec<u8>), anyhow::Error>| -> Result<(), anyhow::Error> {
                     let (_entry, contents) = payload_result?;
@@ -760,6 +754,16 @@ impl Extract {
         S: Write,
         L: Read,
     {
+        let optional_hashes = matches.values_of("file").map(|files_iter| {
+            files_iter
+                .map(|file| {
+                    // If it's a number, it's already a hash and use it as is
+                    file.parse::<FileHash>()
+                        .unwrap_or_else(|_| compute_hash(file.as_bytes()))
+                })
+                .collect::<Vec<_>>()
+        });
+
         extract_cc_file(
             stdout,
             &mut File::open(matches.value_of_os("archive").unwrap())?,
@@ -769,9 +773,11 @@ impl Extract {
                     .value_of_os("root")
                     .unwrap_or_else(|| OsStr::new(".")),
             ),
-            matches
-                .values_of("file")
-                .map(|files_iter| files_iter.collect::<Vec<_>>()),
+            if let Some(ref hashes) = optional_hashes {
+                &hashes
+            } else {
+                &[]
+            },
             if matches.is_present("disable-contents-crypt") {
                 None
             } else {
@@ -963,9 +969,11 @@ where
     ]
 }
 
-fn exec_cmdline<S>(args: &[String], stdout: &mut S) -> Result<(), anyhow::Error>
+fn exec_cmdline<A, S>(args: &[A], stdout: &mut S) -> Result<(), anyhow::Error>
 where
+    A: AsRef<str> + AsRef<OsStr>,
     S: Write,
+    String: From<A>,
 {
     let jobs = build_known_jobs::<S>();
 
@@ -976,7 +984,7 @@ where
     for job in jobs.iter() {
         app = app.subcommand(job.subcommand());
     }
-    let matches = app.get_matches_from_safe(args)?;
+    let matches = app.get_matches_from_safe(&*args)?;
 
     if let Some((found, submatches)) = jobs.iter().find_map(|job| {
         matches
@@ -987,14 +995,16 @@ where
         stdout.flush()?;
         Ok(())
     } else {
-        bail!(WoxError::NoSubcommand(args[0].clone()))
+        bail!(WoxError::NoSubcommand)
     }
 }
 
-fn exec_cmdline_manage_errors<S, E>(args: &[String], stdout: &mut S, stderr: &mut E) -> bool
+fn exec_cmdline_manage_errors<'a, A, S, E>(args: &[A], stdout: &mut S, stderr: &mut E) -> bool
 where
+    A: AsRef<str> + Display + From<&'a str> + AsRef<OsStr>,
     S: Write,
     E: Write,
+    String: From<A>,
 {
     if let Err(err) = exec_cmdline(args, stdout) {
         match err.downcast_ref::<ClapError>() {
@@ -1076,15 +1086,15 @@ mod tests {
     fn cmdline_expect(subcmd: Option<&str>, arg: &str, on_stdout: bool) {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
-        let mut cmdline = SmallVec::<[String; 3]>::new();
+        let mut cmdline = SmallVec::<[&str; 3]>::new();
 
-        cmdline.push("unit-test".into());
+        cmdline.push("unit-test");
 
         if let Some(subcmd_str) = subcmd {
-            cmdline.push(subcmd_str.into());
+            cmdline.push(subcmd_str);
         }
 
-        cmdline.push(arg.into());
+        cmdline.push(arg);
 
         assert!(exec_cmdline_manage_errors(
             &cmdline,
