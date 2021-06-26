@@ -116,6 +116,9 @@ for cc_base in "intro" "xeen" "dark"; do
     ${tool} ${exe} create --archive "${rebuilt}" --root "${extracted_dir}"
     ${tool} ${exe} compare "${cc_file}" "${rebuilt}"
 
+    # Dumb way to test that we can compare more than 2 files
+    ${tool} ${exe} compare "${cc_file}" "${rebuilt}" "${rebuilt}"
+
     # Extract the default save from the archive. Since the save file is larger than 64K, it's
     # in multiple parts. Not all CC files have save files in them.
     var="save_chunks_${cc_base}"

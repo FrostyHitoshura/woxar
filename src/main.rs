@@ -2,7 +2,7 @@
 //!
 //! https://xeen.fandom.com/wiki/CC_File_Format
 
-use anyhow::{anyhow, bail, ensure};
+use anyhow::{anyhow, bail, ensure, Context};
 use bit_vec::BitVec;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use clap::{
@@ -43,16 +43,6 @@ fn parse_u16_hex(input: &str) -> Result<u16, ParseIntError> {
 }
 
 #[derive(Debug, Error)]
-enum CompareReasonError {
-    #[error("The former has {0} file(s) while the latter has {1} file(s)")]
-    DifferentFileCount(usize, usize),
-    #[error("The table of contents differs")]
-    TocDiffers,
-    #[error("One or more file content differs")]
-    ContentDiffers,
-}
-
-#[derive(Debug, Error)]
 enum WoxError {
     #[error("Invalid file name format")]
     FileName,
@@ -62,18 +52,20 @@ enum WoxError {
     GenerateToc(String, FileHash),
     #[error("Hit a race condition")]
     Race,
-    #[error("Archives '{a}' and '{b}' differ: {reason}")]
-    Compare {
-        a: String,
-        b: String,
-        reason: CompareReasonError,
-    },
+    #[error("The former has {0} file(s) while the latter has {1} file(s)")]
+    DifferentFileCount(usize, usize),
+    #[error("The table of contents differs")]
+    TocDiffers,
+    #[error("One or more file content differs")]
+    ContentDiffers,
     #[error("Failed to find file hash {0} in archive")]
     NoHash(FileHash),
     #[error("Requires 2 or more archives to compare")]
     Requires2PlusFiles,
     #[error("No subcommand provided")]
     NoSubcommand,
+    #[error("Archives '{0}' and '{1}' differ")]
+    ArchivesDiffer(String, String),
 }
 
 const ROTATE_ADD_INITIAL: u8 = 0xac;
@@ -646,17 +638,30 @@ fn create_cc_file(
     Ok(encrypt.flush()?)
 }
 
-fn compare_cc_files(paths: [&Path; 2]) -> Result<(), anyhow::Error> {
+fn full_read<R>(reader: &mut R) -> Result<Vec<u8>, IoError>
+where
+    R: Read,
+{
+    let mut buf = vec![];
+    reader.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn compare_cc_files<A, B>(a: &mut A, b: &mut B) -> Result<(), anyhow::Error>
+where
+    A: Read,
+    B: Read,
+{
     type Toc = BTreeMap<FileHash, TocEntry>;
 
     // We don't care about the crypto used for the file contents, use the least expensive one
     let contents_crypt = None;
 
     // Step 1: Load archives data from disk
-    let contents = paths
-        .iter()
-        .map(|path| Ok(Contents::new(fs::read(path)?, FileList::default())))
-        .collect::<Result<SmallVec<[Contents; 2]>, anyhow::Error>>()?;
+    let contents = [
+        Contents::new(full_read(a)?, FileList::default()),
+        Contents::new(full_read(b)?, FileList::default()),
+    ];
 
     // Step 2: If there's a difference in file count, then the archive are different
     let file_counts = contents
@@ -666,14 +671,7 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), anyhow::Error> {
 
     ensure!(
         file_counts[0] == file_counts[1],
-        WoxError::Compare {
-            a: paths[0].to_str().unwrap().to_string(),
-            b: paths[1].to_str().unwrap().to_string(),
-            reason: CompareReasonError::DifferentFileCount(
-                file_counts[0].into(),
-                file_counts[1].into(),
-            ),
-        }
+        WoxError::DifferentFileCount(file_counts[0].into(), file_counts[1].into()),
     );
 
     let tocs = contents
@@ -687,42 +685,23 @@ fn compare_cc_files(paths: [&Path; 2]) -> Result<(), anyhow::Error> {
         .collect::<Result<SmallVec<[Toc; 2]>, anyhow::Error>>()?;
 
     // Step 3: If the TOC is different, then the archives are different.
-    if !tocs[0]
-        .values()
-        .zip(tocs[1].values())
-        .all(|(a_entry, b_entry)| a_entry.id == b_entry.id && a_entry.len == b_entry.len)
-    {
-        bail!(WoxError::Compare {
-            a: paths[0].to_str().unwrap().to_string(),
-            b: paths[1].to_str().unwrap().to_string(),
-            reason: CompareReasonError::TocDiffers,
-        });
-    }
+    ensure!(
+        tocs[0]
+            .values()
+            .zip(tocs[1].values())
+            .all(|(a_entry, b_entry)| a_entry.id == b_entry.id && a_entry.len == b_entry.len),
+        WoxError::TocDiffers
+    );
 
     // Step 4: Last and more expensive check: make sure that the file contents is the same
-    if tocs[0]
-        .values()
-        .zip(tocs[1].values())
-        .all(|(a_entry, b_entry)| {
-            if let (Ok(a_payload), Ok(b_payload)) = (
-                contents[0].fetch_payload(&a_entry, contents_crypt.clone()),
-                contents[1].fetch_payload(&b_entry, contents_crypt.clone()),
-            ) {
-                a_payload == b_payload
-            } else {
-                // XXX: We lost the error here...
-                false
-            }
-        })
-    {
-        Ok(())
-    } else {
-        bail!(WoxError::Compare {
-            a: paths[0].to_str().unwrap().to_string(),
-            b: paths[1].to_str().unwrap().to_string(),
-            reason: CompareReasonError::ContentDiffers,
-        })
+    for (a_entry, b_entry) in tocs[0].values().zip(tocs[1].values()) {
+        let a_payload = contents[0].fetch_payload(&a_entry, contents_crypt.clone())?;
+        let b_payload = contents[1].fetch_payload(&b_entry, contents_crypt.clone())?;
+
+        ensure!(a_payload == b_payload, WoxError::ContentDiffers);
     }
+
+    Ok(())
 }
 
 trait Job<S>
@@ -914,19 +893,33 @@ where
 
     fn execute(&self, matches: &ArgMatches, _stdout: &mut S) -> Result<(), anyhow::Error> {
         let mut iter = matches.values_of("archives").unwrap();
-        let first = iter.next();
-        let second = iter.next();
-        let third = iter.next();
+        let reference_path = iter.next().ok_or(WoxError::Requires2PlusFiles)?;
+        let mut reference = File::open(Path::new(reference_path))?;
 
-        if third.is_some() {
-            unimplemented!()
+        let mut did_compare = false;
+        for comparee_path in iter {
+            //
+            // When we compare more than 2 files, rewind the first file (we call it "reference"
+            // here) and compare it with the third (or fourth, etc...) file. It's not the best
+            // way to do this because:
+            //
+            // 1) It implies that "reference" implements Seek.
+            // 2) We are going to extract "reference" more than once.
+            //
+            if did_compare {
+                reference.seek(SeekFrom::Start(0))?;
+            }
+
+            compare_cc_files(&mut reference, &mut File::open(Path::new(comparee_path))?)
+                .with_context(|| {
+                    WoxError::ArchivesDiffer(reference_path.into(), comparee_path.into())
+                })?;
+
+            did_compare = true;
         }
 
-        if let (Some(first), Some(second)) = (first, second) {
-            compare_cc_files([Path::new(first), Path::new(second)])
-        } else {
-            bail!(WoxError::Requires2PlusFiles)
-        }
+        ensure!(did_compare, WoxError::Requires2PlusFiles);
+        Ok(())
     }
 }
 
@@ -1047,6 +1040,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::empty;
 
     #[test]
     fn rotate_add_crypt() {
@@ -1131,5 +1125,17 @@ mod tests {
                 cmdline_expect(Some(job.name()), arg.0, arg.1);
             }
         }
+    }
+
+    #[test]
+    fn compare_archives() {
+        assert!(compare_cc_files(&mut empty(), &mut empty()).is_err());
+
+        const ARCHIVE_WITH_NO_FILES: [u8; 2] = [0, 0];
+        compare_cc_files(
+            &mut Cursor::new(&ARCHIVE_WITH_NO_FILES),
+            &mut Cursor::new(&ARCHIVE_WITH_NO_FILES),
+        )
+        .unwrap();
     }
 }
