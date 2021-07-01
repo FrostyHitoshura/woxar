@@ -17,8 +17,7 @@ use std::{
     env,
     ffi::OsStr,
     fmt::Display,
-    fs,
-    fs::{create_dir_all, File},
+    fs::File,
     io::{
         stderr, stdout, BufRead, BufReader, Cursor, Error as IoError, Read, Seek, SeekFrom, Write,
     },
@@ -28,6 +27,7 @@ use std::{
     str, u16,
 };
 use thiserror::Error;
+use vfs::{PhysicalFS, VfsPath};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
@@ -502,7 +502,7 @@ fn extract_cc_file<A, S, L>(
     stdout: &mut S,
     archive_stream: &mut A,
     list_stream: L,
-    root_directory: &Path,
+    root_directory: &VfsPath,
     hashes_to_extract: &[FileHash],
     contents_crypt: Option<Crypt>,
 ) -> Result<(), anyhow::Error>
@@ -516,7 +516,7 @@ where
 
     let contents = Contents::new(data, FileList::try_from(ReadFileList(list_stream))?);
 
-    create_dir_all(root_directory)?;
+    root_directory.create_dir_all()?;
 
     if !hashes_to_extract.is_empty() {
         // Extract specific files arm: writing order is important to respect the order the user set
@@ -535,10 +535,10 @@ where
         contents.payload_iter(contents_crypt)?.try_for_each(
             |payload_result: Result<(TocEntry, Vec<u8>), anyhow::Error>| -> Result<(), anyhow::Error> {
                 let payload = payload_result?;
-                fs::write(
-                    root_directory.join(contents.entry_name(&payload.0)),
-                    payload.1,
-                )?;
+                let mut file = 
+                    root_directory.join(&contents.entry_name(&payload.0))?.create_file()?;
+
+                file.write_all(&payload.1)?;
                 Ok(())
             },
         )
@@ -550,9 +550,9 @@ struct FilePayload {
     payload: Vec<u8>,
 }
 
-fn create_cc_file(
-    archive_path: &Path,
-    root_directory: &Path,
+fn create_cc_file<W: Write>(
+    archive_writer: W,
+    root_directory: &VfsPath,
     contents_crypt: Option<Crypt>,
 ) -> Result<(), anyhow::Error> {
     const TOC_START: usize = 2;
@@ -564,51 +564,58 @@ fn create_cc_file(
 
     root_directory
         .read_dir()?
-        .try_for_each(|dir_entry_result| -> Result<(), anyhow::Error> {
-            let dir_entry = dir_entry_result?;
+        .try_for_each(|path| -> Result<(), anyhow::Error> {
+            let mut file_reader = path.open_file()?;
+            let mut payload = vec![];
+            file_reader.read_to_end(&mut payload)?;
 
-            if let Some(path) = dir_entry.file_name().to_str() {
-                let toc = TocEntry {
-                    // If "extract_cc_file" doesn't know the file name, it will output the hash in
-                    // decimal as file name. So first try to parse the file name as a u16 and it
-                    // works, then assume it's the hash. Otherwise, it's a real file name and
-                    // compute the hash from it.
-                    id: path
-                        .parse::<u16>()
-                        .unwrap_or_else(|_| compute_hash(path.as_bytes())),
-                    offset: 0, // Will be filled later
-                    len: FileSize::try_from(dir_entry.metadata()?.len())?,
+            // The hashing algorithm used only considers the file name. Even if the archive doesn't
+            // support directories, all VfsPath are prefixed by a '/' that we need to remove.
+            // Consider anything after the last slash to be the file name.
+            let full_path_str = path.as_str();
+            let path_str = &full_path_str[full_path_str.rfind('/').unwrap() + 1..];
+
+            let toc = TocEntry {
+                // If "extract_cc_file" doesn't know the file name, it will output the hash in
+                // decimal as file name. So first try to parse the file name as a u16 and it
+                // works, then assume it's the hash. Otherwise, it's a real file name and
+                // compute the hash from it.
+                id: path_str
+                    .parse::<u16>()
+                    .unwrap_or_else(|_| compute_hash(path_str.as_bytes())),
+                offset: 0, // Will be filled later
+                len: FileSize::try_from(payload.len())?,
+            };
+
+            // Make sure the file we add doesn't clash hash-wise with a file we already cached
+            if let Vacant(slot) = cache.entry(toc.id) {
+                let file_payload = FilePayload {
+                    entry: toc,
+                    payload,
                 };
 
-                // Make sure the file we add doesn't clash hash-wise with a file we already cached
-                if let Vacant(slot) = cache.entry(toc.id) {
-                    let file_payload = FilePayload {
-                        entry: toc,
-                        payload: fs::read(dir_entry.path())?,
-                    };
+                // Make sure that the size we read from the directory entry matches with what we
+                // read from the actual file...
+                if file_payload.entry.len as usize == file_payload.payload.len() {
+                    archive_size += TOC_EACH_SIZE + file_payload.payload.len();
 
-                    // Make sure that the size we read from the directory entry matches with what we
-                    // read from the actual file...
-                    if file_payload.entry.len as usize == file_payload.payload.len() {
-                        archive_size += TOC_EACH_SIZE + file_payload.payload.len();
+                    slot.insert(file_payload);
 
-                        slot.insert(file_payload);
-
-                        Ok(())
-                    } else {
-                        // Race condition between readdir and when we actually read the file?
-                        Err(anyhow!(WoxError::Race))
-                    }
+                    Ok(())
                 } else {
-                    Err(anyhow!(WoxError::GenerateToc(path.to_string(), toc.id)))
+                    // Race condition between readdir and when we actually read the file?
+                    Err(anyhow!(WoxError::Race))
                 }
             } else {
-                Err(anyhow!(WoxError::FileName))
+                Err(anyhow!(WoxError::GenerateToc(
+                    path.as_str().to_string(),
+                    toc.id
+                )))
             }
         })?;
 
     let archive_files = u16::try_from(cache.len())?;
-    let mut encrypt = Encrypt::new(File::create(archive_path)?, None);
+    let mut encrypt = Encrypt::new(archive_writer, None);
     let mut payload_offset = TOC_START + TOC_EACH_SIZE * archive_files as usize;
 
     // Step 1: Write the number of files in this archive
@@ -747,11 +754,14 @@ impl Extract {
             stdout,
             &mut File::open(matches.value_of_os("archive").unwrap())?,
             file_list,
-            Path::new(
-                matches
-                    .value_of_os("root")
-                    .unwrap_or_else(|| OsStr::new(".")),
-            ),
+            &VfsPath::new(PhysicalFS::new(
+                Path::new(
+                    matches
+                        .value_of_os("root")
+                        .unwrap_or_else(|| OsStr::new(".")),
+                )
+                .to_path_buf(),
+            )),
             if let Some(ref hashes) = optional_hashes {
                 &hashes
             } else {
@@ -865,8 +875,10 @@ where
 
     fn execute(&self, matches: &ArgMatches, _stdout: &mut S) -> Result<(), anyhow::Error> {
         create_cc_file(
-            Path::new(matches.value_of_os("archive").unwrap()),
-            Path::new(matches.value_of_os("root").unwrap()),
+            File::create(Path::new(matches.value_of_os("archive").unwrap()))?,
+            &VfsPath::new(PhysicalFS::new(
+                Path::new(matches.value_of_os("root").unwrap()).to_path_buf(),
+            )),
             if matches.is_present("disable-contents-crypt") {
                 None
             } else {
@@ -1041,6 +1053,7 @@ fn main() {
 mod tests {
     use super::*;
     use std::io::empty;
+    use vfs::MemoryFS;
 
     #[test]
     fn rotate_add_crypt() {
@@ -1137,5 +1150,70 @@ mod tests {
             &mut Cursor::new(&ARCHIVE_WITH_NO_FILES),
         )
         .unwrap();
+    }
+
+    fn fs_write(root: &VfsPath, name: &str, contents: &[u8]) {
+        let path = root.join(name).unwrap();
+        let mut file = path.create_file().unwrap();
+        file.write_all(contents).unwrap();
+    }
+
+    fn build_memory_fs() -> VfsPath {
+        let root = VfsPath::new(MemoryFS::new());
+
+        fs_write(&root, "A.TXT", b"A");
+        fs_write(&root, "B.TXT", b"BB");
+        fs_write(&root, "C.TXT", b"CCC");
+
+        root
+    }
+
+    // List of files in the file system created by build_memory_fs().
+    fn archive_file_list() -> Cursor<&'static [u8]> {
+        Cursor::new(b"A.TXT\nB.TXT\nC.TXT\n")
+    }
+
+    // An archived version of the file system created by build_memory_fs().
+    const ARCHIVE_CONTENTS: &[u8] = 
+            &[
+                3, 0, 130, 132, 40, 199, 46, 148, 186, 224, 184, 182, 90, 249, 32, 198, 172, 210,
+                174, 168, 204, 235, 18, 57, 158, 196, 116, 119, 119, 118, 118, 118
+            ];
+
+    fn fs_as_tree(root: &VfsPath) -> BTreeMap<String, Vec<u8>> {
+        root.read_dir().unwrap().map(|path| {
+            let mut reader = path.open_file().unwrap();
+            let mut contents = vec![];
+            reader.read_to_end(&mut contents).unwrap();
+
+            (path.as_str().into(), contents)
+        }).collect()
+    }
+
+    fn compare_fs(a: &VfsPath, b: &VfsPath) -> bool {
+        fs_as_tree(a) == fs_as_tree(b)
+    }
+
+    #[test]
+    fn create_archive() {
+        let root = build_memory_fs();
+
+        let mut archive = vec![];
+        create_cc_file(&mut archive, &root, Some(Crypt::Xor)).unwrap();
+        assert_eq!(
+            ARCHIVE_CONTENTS,
+            archive.as_slice()
+        );
+    }
+
+    #[test]
+    fn extract_archive() {
+        let root = VfsPath::new(MemoryFS::new());
+
+        let mut stdout = vec![];
+        extract_cc_file(&mut stdout, &mut Cursor::new(ARCHIVE_CONTENTS), archive_file_list(), &root, &[], Some(Crypt::Xor)).unwrap();
+
+        assert!(stdout.is_empty());
+        assert!(compare_fs(&root, &build_memory_fs()));
     }
 }
