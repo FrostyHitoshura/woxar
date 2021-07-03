@@ -44,8 +44,10 @@ fn parse_u16_hex(input: &str) -> Result<u16, ParseIntError> {
 
 #[derive(Debug, Error)]
 enum WoxError {
-    #[error("Invalid file name format")]
-    FileName,
+    #[error("Empty file name")]
+    EmptyFileName,
+    #[error("Invalid character '{0}' in file name")]
+    InvalidCharInFileName(char),
     #[error("Found invalid data in the table of contents")]
     ReadToc,
     #[error("Can't encode file '{0}' as hash {1:#06x} is already in use")]
@@ -176,7 +178,12 @@ where
             let mut csv = line.split(|ch| ch == ',');
 
             if let Some(name) = csv.next() {
-                ensure!(!name.is_empty(), WoxError::FileName);
+                ensure!(!name.is_empty(), WoxError::EmptyFileName);
+
+                // Forbid characters that have special meaning for POSIX file systems.
+                for forbidden in [ '/', char::from_u32(0).unwrap() ] {
+                    ensure!(name.find(forbidden).is_none(), WoxError::InvalidCharInFileName(forbidden));
+                }
 
                 let mut entry = ListEntry::new(name.to_string());
 
@@ -1088,6 +1095,21 @@ mod tests {
 
         const TWO_BYTES: [u8; 2] = [12, 34];
         assert_eq!(compute_hash(&TWO_BYTES), 6178);
+    }
+
+    #[test]
+    fn file_list() {
+        // Allow lines with only the file name.
+        FileList::try_from(ReadFileList(Cursor::new(b"A.TXT\n"))).unwrap();
+
+        // Lines can also come with the hash value as well as the expected file size in bytes.
+        FileList::try_from(ReadFileList(Cursor::new(b"A.TXT,0x1234,1\n"))).unwrap();
+
+        // Disallow empty file names.
+        assert!(FileList::try_from(ReadFileList(Cursor::new(b",0x1234,1\n"))).is_err());
+
+        // File names should not have slashes in them.
+        assert!(FileList::try_from(ReadFileList(Cursor::new(b"INVALID/NAME.TXT\n"))).is_err());
     }
 
     fn cmdline_expect(subcmd: Option<&str>, arg: &str, on_stdout: bool) {
