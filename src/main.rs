@@ -19,7 +19,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::{
-        stderr, stdout, BufRead, BufReader, Cursor, Error as IoError, Read, Seek, SeekFrom, Write,
+        stdin, stderr, stdout, BufRead, BufReader, Cursor, Error as IoError, Read, Seek, SeekFrom, Write,
     },
     num::ParseIntError,
     path::Path,
@@ -718,6 +718,22 @@ where
     Ok(())
 }
 
+fn open_file_or_stdin(path: &OsStr) -> Result<Box<dyn Read>, anyhow::Error> {
+    if path == "-" {
+        Ok(Box::new(stdin()))
+    } else {
+        Ok(Box::new(File::open(path)?))
+    }
+}
+
+fn create_file_or_stdout(path: &OsStr) -> Result<Box<dyn Write>, anyhow::Error> {
+    if path == "-" {
+        Ok(Box::new(stdout()))
+    } else {
+        Ok(Box::new(File::create(path)?))
+    }
+}
+
 trait Job<S>
 where
     S: Write,
@@ -759,7 +775,7 @@ impl Extract {
 
         extract_cc_file(
             stdout,
-            &mut File::open(matches.value_of_os("archive").unwrap())?,
+            &mut open_file_or_stdin(matches.value_of_os("archive").unwrap())?,
             file_list,
             &VfsPath::new(PhysicalFS::new(
                 Path::new(
@@ -799,7 +815,7 @@ where
                     .short("a")
                     .required(true)
                     .value_name("FILE")
-                    .help("Archive file to extract"),
+                    .help("Archive file to extract, use '-' for stdin"),
             )
             .arg(
                 Arg::with_name("fl")
@@ -861,7 +877,7 @@ where
                 .short("a")
                 .required(true)
                 .value_name("FILE")
-                .help("Archive file to create"),
+                .help("Archive file to create, use '-' for stdout"),
         )
         .arg(
             Arg::with_name("root")
@@ -882,7 +898,7 @@ where
 
     fn execute(&self, matches: &ArgMatches, _stdout: &mut S) -> Result<(), anyhow::Error> {
         create_cc_file(
-            File::create(Path::new(matches.value_of_os("archive").unwrap()))?,
+            create_file_or_stdout(matches.value_of_os("archive").unwrap())?,
             &VfsPath::new(PhysicalFS::new(
                 Path::new(matches.value_of_os("root").unwrap()).to_path_buf(),
             )),
@@ -1229,13 +1245,33 @@ mod tests {
     }
 
     #[test]
-    fn extract_archive() {
+    fn extract_whole_archive() {
         let root = VfsPath::new(MemoryFS::new());
 
         let mut stdout = vec![];
         extract_cc_file(&mut stdout, &mut Cursor::new(ARCHIVE_CONTENTS), archive_file_list(), &root, &[], Some(Crypt::Xor)).unwrap();
 
+        // When no hashes are provided, the contents of the archive will be written to the provided
+        // file system.
         assert!(stdout.is_empty());
         assert!(compare_fs(&root, &build_memory_fs()));
+    }
+
+    #[test]
+    fn extract_selected_hash_archive() {
+        let root = VfsPath::new(MemoryFS::new());
+        let hashes = [
+            compute_hash(b"A.TXT"),
+            compute_hash(b"C.TXT"),
+            compute_hash(b"B.TXT"),
+        ];
+
+        let mut stdout = vec![];
+        extract_cc_file(&mut stdout, &mut Cursor::new(ARCHIVE_CONTENTS), archive_file_list(), &root, &hashes, Some(Crypt::Xor)).unwrap();
+
+        // With provided hashes, the selected hashes of the archive will be written to the provided
+        // "stdout" stream. Ordering of the hashes is expected to be reflected in the output.
+        assert_eq!(&stdout, b"ACCCBB");
+        assert_eq!(root.read_dir().unwrap().count(), 0);
     }
 }

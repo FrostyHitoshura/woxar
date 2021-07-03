@@ -98,8 +98,9 @@ for cc_base in "intro" "xeen" "dark"; do
     extracted_dir="${scratch_dir}/extracted"
     exe="target/release/woxar"
     rebuilt="${scratch_dir}/rebuilt.cc"
+    rebuilt_stdout="${scratch_dir}/rebuilt-stdout.cc"
 
-    rm -f "${rebuilt}"
+    rm -f "${rebuilt}" "${rebuilt_stdout}"
     rm -fr "${extracted_dir}"
     mkdir -p "${extracted_dir}"
 
@@ -112,12 +113,16 @@ for cc_base in "intro" "xeen" "dark"; do
     fi
 
     ${start_tests}
-    ${tool} ${exe} extract --archive "${cc_file}" --root "${extracted_dir}" --fl "${fl_file}"
-    ${tool} ${exe} create --archive "${rebuilt}" --root "${extracted_dir}"
-    ${tool} ${exe} compare "${cc_file}" "${rebuilt}"
 
-    # Dumb way to test that we can compare more than 2 files
-    ${tool} ${exe} compare "${cc_file}" "${rebuilt}" "${rebuilt}"
+    # The provided archive can be a file or stdin ("-").
+    # XXX: Write a test that make sure that the result are the same if you extract from a file or stdin.
+    ${tool} ${exe} extract --archive "-" --root "${extracted_dir}" --fl "${fl_file}" < "${cc_file}"
+
+    # The provided archive can be a file or stdout ("-").
+    ${tool} ${exe} create --archive "${rebuilt}" --root "${extracted_dir}"
+    ${tool} ${exe} create --archive "-" --root "${extracted_dir}" > "${rebuilt_stdout}"
+
+    ${tool} ${exe} compare "${cc_file}" "${rebuilt}" "${rebuilt_stdout}"
 
     # Extract the default save from the archive. Since the save file is larger than 64K, it's
     # in multiple parts. Not all CC files have save files in them.
