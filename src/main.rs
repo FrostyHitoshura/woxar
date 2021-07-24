@@ -3,7 +3,7 @@
 //! https://xeen.fandom.com/wiki/CC_File_Format
 
 use anyhow::{anyhow, bail, ensure, Context};
-use bit_vec::BitVec;
+use bitvec::{prelude::*, vec::BitVec};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use clap::{
     App, Arg, ArgMatches, Error as ClapError,
@@ -21,7 +21,6 @@ use std::{
     io::{
         stdin, stderr, stdout, BufRead, BufReader, Cursor, Error as IoError, Read, Seek, SeekFrom, Write,
     },
-    num::ParseIntError,
     path::Path,
     process::exit,
     str, u16,
@@ -29,18 +28,10 @@ use std::{
 use thiserror::Error;
 use vfs::{PhysicalFS, VfsPath};
 
+use woxar::name::WoxHashedName;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
-
-fn parse_u16_hex(input: &str) -> Result<u16, ParseIntError> {
-    let starting_offset = if input.starts_with("0x") || input.starts_with("0X") {
-        2
-    } else {
-        0
-    };
-
-    u16::from_str_radix(&input[starting_offset..], 16)
-}
 
 #[derive(Debug, Error)]
 enum WoxError {
@@ -51,7 +42,7 @@ enum WoxError {
     #[error("Found invalid data in the table of contents")]
     ReadToc,
     #[error("Can't encode file '{0}' as hash {1:#06x} is already in use")]
-    GenerateToc(String, FileHash),
+    GenerateToc(String, WoxHashedName),
     #[error("Hit a race condition")]
     Race,
     #[error("The former has {0} file(s) while the latter has {1} file(s)")]
@@ -61,7 +52,7 @@ enum WoxError {
     #[error("One or more file content differs")]
     ContentDiffers,
     #[error("Failed to find file hash {0} in archive")]
-    NoHash(FileHash),
+    NoHash(WoxHashedName),
     #[error("Requires 2 or more archives to compare")]
     Requires2PlusFiles,
     #[error("No subcommand provided")]
@@ -81,12 +72,11 @@ enum Crypt {
 
 type FileCount = u16;
 type FileSize = u16;
-type FileHash = u16;
-type ListHash = HashMap<FileHash, ListEntry>;
+type ListHash = HashMap<WoxHashedName, ListEntry>;
 
 struct ListEntry {
     name: String,
-    expected_hash: Option<FileHash>,
+    expected_hash: Option<WoxHashedName>,
     expected_size: Option<FileSize>,
 }
 
@@ -117,7 +107,7 @@ struct Encrypt<S> {
 
 #[derive(Copy, Clone)]
 struct TocEntry {
-    id: u16,
+    id: WoxHashedName,
     offset: u32, // XXX: Actually an u24...
     len: FileSize,
     // In the file... padding: u8 which is expected to be always 0
@@ -188,14 +178,14 @@ where
                 let mut entry = ListEntry::new(name.to_string());
 
                 if let Some(hash) = csv.next() {
-                    entry.expected_hash = Some(parse_u16_hex(hash)?);
+                    entry.expected_hash = Some(hash.parse()?);
                 }
 
                 if let Some(size) = csv.next() {
                     entry.expected_size = Some(size.parse()?);
                 }
 
-                list.insert(compute_hash(name.as_bytes()), entry);
+                list.insert(WoxHashedName::from(name.as_bytes()), entry);
             };
         }
 
@@ -216,7 +206,7 @@ impl Contents {
         Contents { data, list }
     }
 
-    fn find_entry(&self, hash: FileHash) -> Option<&ListEntry> {
+    fn find_entry(&self, hash: WoxHashedName) -> Option<&ListEntry> {
         self.list.list.get(&hash)
     }
 
@@ -257,7 +247,7 @@ impl Contents {
             cursor,
             idx: 0,
             total,
-            verify: BitVec::from_elem(FileHash::max_value() as usize, false),
+            verify: bitvec![0; WoxHashedName::MAX as usize],
         })
     }
 
@@ -271,7 +261,7 @@ impl Contents {
 
     fn payload_filtered_ordered_iter(
         &self,
-        hashes: &[FileHash],
+        hashes: &[WoxHashedName],
         contents_crypt: Option<Crypt>,
     ) -> Result<PayloadBufferedIter, anyhow::Error> {
         // Read the whole toc and save the entries we are interested for
@@ -414,7 +404,7 @@ impl TocEntry {
         S: Read,
     {
         let entry = TocEntry {
-            id: source.read_u16::<LittleEndian>()?,
+            id: WoxHashedName::from(source.read_u16::<LittleEndian>()?),
             offset: source.read_u24::<LittleEndian>()?,
             len: source.read_u16::<LittleEndian>()?,
         };
@@ -431,7 +421,7 @@ impl TocEntry {
     where
         S: Write,
     {
-        sink.write_u16::<LittleEndian>(self.id)?;
+        sink.write_u16::<LittleEndian>(self.id.raw())?;
         sink.write_u24::<LittleEndian>(self.offset)?;
         sink.write_u16::<LittleEndian>(self.len)?;
         sink.write_u8(0)
@@ -446,7 +436,7 @@ impl<'a> Iterator for TocIter<'a> {
 
         if self.idx <= self.total {
             Some(TocEntry::new(&mut self.cursor).and_then(|entry| {
-                let bit = entry.id as usize;
+                let bit = entry.id.raw() as usize;
 
                 if self.verify[bit] {
                     Err(anyhow!(WoxError::ReadToc))
@@ -494,23 +484,12 @@ impl<'a> Iterator for PayloadBufferedIter<'a> {
     }
 }
 
-fn compute_hash(name: &[u8]) -> FileHash {
-    if name.is_empty() {
-        // Follows ScummVM's BaseCCArchive::convertNameToId
-        0xffff
-    } else {
-        name.iter().skip(1).fold(name[0] as FileHash, |acc, byte| {
-            FileHash::wrapping_add(FileHash::rotate_right(acc, 7), *byte as FileHash)
-        })
-    }
-}
-
 fn extract_cc_file<A, S, L>(
     stdout: &mut S,
     archive_stream: &mut A,
     list_stream: L,
     root_directory: &VfsPath,
-    hashes_to_extract: &[FileHash],
+    hashes_to_extract: &[WoxHashedName],
     contents_crypt: Option<Crypt>,
 ) -> Result<(), anyhow::Error>
 where
@@ -564,7 +543,7 @@ fn create_cc_file<W: Write>(
 ) -> Result<(), anyhow::Error> {
     const TOC_START: usize = 2;
     const TOC_EACH_SIZE: usize = 8; // sizeof(TocEntry) + 1
-    let mut cache: BTreeMap<FileHash, FilePayload> = BTreeMap::new();
+    let mut cache: BTreeMap<WoxHashedName, FilePayload> = BTreeMap::new();
 
     // Starts with a u16 about the number of files present in the archive
     let mut archive_size = TOC_START;
@@ -589,7 +568,8 @@ fn create_cc_file<W: Write>(
                 // compute the hash from it.
                 id: path_str
                     .parse::<u16>()
-                    .unwrap_or_else(|_| compute_hash(path_str.as_bytes())),
+                    .map(WoxHashedName::from)
+                    .unwrap_or_else(|_| WoxHashedName::from(path_str.as_bytes())),
                 offset: 0, // Will be filled later
                 len: FileSize::try_from(payload.len())?,
             };
@@ -666,7 +646,7 @@ where
     A: Read,
     B: Read,
 {
-    type Toc = BTreeMap<FileHash, TocEntry>;
+    type Toc = BTreeMap<WoxHashedName, TocEntry>;
 
     // We don't care about the crypto used for the file contents, use the least expensive one
     let contents_crypt = None;
@@ -767,8 +747,8 @@ impl Extract {
             files_iter
                 .map(|file| {
                     // If it's a number, it's already a hash and use it as is
-                    file.parse::<FileHash>()
-                        .unwrap_or_else(|_| compute_hash(file.as_bytes()))
+                    file.parse::<WoxHashedName>()
+                        .unwrap_or_else(|_| WoxHashedName::from(file.as_bytes()))
                 })
                 .collect::<Vec<_>>()
         });
@@ -980,7 +960,7 @@ where
         Ok(writeln!(
             stdout,
             "{}",
-            compute_hash(matches.value_of("name").unwrap().as_bytes())
+            WoxHashedName::from(matches.value_of("name").unwrap().as_bytes())
         )?)
     }
 }
@@ -1099,18 +1079,6 @@ mod tests {
             .collect::<SmallVec<Buf>>();
 
         assert_eq!(PLAINTEXT, &decrypted[..]);
-    }
-
-    #[test]
-    fn hash() {
-        // Not expected to happen for real, simply make sure we don't crash!
-        compute_hash(&[0; 0]);
-
-        const SIXTY_FOUR: [u8; 1] = [64];
-        assert_eq!(compute_hash(&SIXTY_FOUR), 64);
-
-        const TWO_BYTES: [u8; 2] = [12, 34];
-        assert_eq!(compute_hash(&TWO_BYTES), 6178);
     }
 
     #[test]
@@ -1261,9 +1229,9 @@ mod tests {
     fn extract_selected_hash_archive() {
         let root = VfsPath::new(MemoryFS::new());
         let hashes = [
-            compute_hash(b"A.TXT"),
-            compute_hash(b"C.TXT"),
-            compute_hash(b"B.TXT"),
+            WoxHashedName::from("A.TXT".as_bytes()),
+            WoxHashedName::from("C.TXT".as_bytes()),
+            WoxHashedName::from("B.TXT".as_bytes()),
         ];
 
         let mut stdout = vec![];
