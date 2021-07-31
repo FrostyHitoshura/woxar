@@ -98,7 +98,7 @@ impl AsciiNameSet {
 
     pub fn generator(&self) -> NameIter {
         NameIter {
-            generator: &self,
+            generator: self,
             count: 0,
             done: false,
             max_name: self.prefix.0.len()
@@ -213,7 +213,7 @@ fn match_uint(needle: &[u8]) -> Option<usize> {
 
     let mut state = State::Init;
     for (index, ch) in needle.iter().enumerate() {
-        let digit = (b'0'..b'9').contains(&ch);
+        let digit = (b'0'..b'9').contains(ch);
 
         // The .parse() method allows leading 0 as valid and we don't want that feature here.
         state = match (state, ch) {

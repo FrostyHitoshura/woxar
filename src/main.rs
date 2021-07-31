@@ -508,7 +508,7 @@ where
         // Extract specific files arm: writing order is important to respect the order the user set
         // by the user on the command line
         contents
-            .payload_filtered_ordered_iter(&hashes_to_extract, contents_crypt)?
+            .payload_filtered_ordered_iter(hashes_to_extract, contents_crypt)?
             .try_for_each(
                 |payload_result: Result<(TocEntry, Vec<u8>), anyhow::Error>| -> Result<(), anyhow::Error> {
                     let (_entry, contents) = payload_result?;
@@ -689,8 +689,8 @@ where
 
     // Step 4: Last and more expensive check: make sure that the file contents is the same
     for (a_entry, b_entry) in tocs[0].values().zip(tocs[1].values()) {
-        let a_payload = contents[0].fetch_payload(&a_entry, contents_crypt.clone())?;
-        let b_payload = contents[1].fetch_payload(&b_entry, contents_crypt.clone())?;
+        let a_payload = contents[0].fetch_payload(a_entry, contents_crypt.clone())?;
+        let b_payload = contents[1].fetch_payload(b_entry, contents_crypt.clone())?;
 
         ensure!(a_payload == b_payload, WoxError::ContentDiffers);
     }
@@ -766,7 +766,7 @@ impl Extract {
                 .to_path_buf(),
             )),
             if let Some(ref hashes) = optional_hashes {
-                &hashes
+                hashes
             } else {
                 &[]
             },
@@ -999,7 +999,7 @@ where
             .subcommand_matches(job.name())
             .map(|submatches| (job, submatches))
     }) {
-        found.execute(&submatches, stdout)?;
+        found.execute(submatches, stdout)?;
         stdout.flush()?;
         Ok(())
     } else {
