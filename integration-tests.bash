@@ -94,7 +94,7 @@ cargo build --release
 
 for cc_base in "intro" "xeen" "dark"; do
     cc_file="${orig_data_dir}/${cc_base^^}.CC"
-    fl_file="data/${cc_base}.fl"
+    dict_file="data/${cc_base}.fl"
     extracted_dir="${scratch_dir}/extracted"
     exe="target/release/woxar"
     rebuilt="${scratch_dir}/rebuilt.cc"
@@ -116,7 +116,7 @@ for cc_base in "intro" "xeen" "dark"; do
 
     # The provided archive can be a file or stdin ("-").
     # XXX: Write a test that make sure that the result are the same if you extract from a file or stdin.
-    ${tool} ${exe} extract --archive "-" --root "${extracted_dir}" --fl "${fl_file}" < "${cc_file}"
+    ${tool} ${exe} extract --archive "-" --root "${extracted_dir}" --dictionary "${dict_file}" < "${cc_file}"
 
     # The provided archive can be a file or stdout ("-").
     ${tool} ${exe} create --archive "${rebuilt}" --root "${extracted_dir}"
@@ -146,7 +146,7 @@ for cc_base in "intro" "xeen" "dark"; do
         # Extract the save file: these subarchive are not encrypted
         extracted_save_dir="${scratch_dir}/${cc_base}_save"
         mkdir -p "${extracted_save_dir}"
-        ${tool} ${exe} extract --archive "${extracted_save}" --root "${extracted_save_dir}" --fl "data/save.fl" --disable-contents-crypt
+        ${tool} ${exe} extract --archive "${extracted_save}" --root "${extracted_save_dir}" --dictionary "data/save.fl" --disable-contents-crypt
     fi
 
     ${end_tests}

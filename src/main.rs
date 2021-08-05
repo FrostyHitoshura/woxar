@@ -12,14 +12,14 @@ use clap::{
 };
 use smallvec::SmallVec;
 use std::{
-    collections::{btree_map::Entry::Vacant, BTreeMap, HashMap},
+    collections::{btree_map::Entry::Vacant, BTreeMap},
     convert::TryFrom,
     env,
     ffi::OsStr,
     fmt::Display,
     fs::File,
     io::{
-        stdin, stderr, stdout, BufRead, BufReader, Cursor, Error as IoError, Read, Seek, SeekFrom, Write,
+        stdin, stderr, stdout, Cursor, Error as IoError, Read, Seek, SeekFrom, Write,
     },
     path::Path,
     process::exit,
@@ -28,17 +28,15 @@ use std::{
 use thiserror::Error;
 use vfs::{PhysicalFS, VfsPath};
 
-use woxar::name::WoxHashedName;
+use woxar::name::{WoxName, WoxHashedName, WoxReverseDictionary, ReadWoxReverseDictionary, WoxNameError};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
 
 #[derive(Debug, Error)]
 enum WoxError {
-    #[error("Empty file name")]
-    EmptyFileName,
-    #[error("Invalid character '{0}' in file name")]
-    InvalidCharInFileName(char),
+    #[error("Invalid file name")]
+    InvalidFileName(#[from] WoxNameError),
     #[error("Found invalid data in the table of contents")]
     ReadToc,
     #[error("Can't encode file '{0}' as hash {1:#06x} is already in use")]
@@ -72,21 +70,10 @@ enum Crypt {
 
 type FileCount = u16;
 type FileSize = u16;
-type ListHash = HashMap<WoxHashedName, ListEntry>;
-
-struct ListEntry {
-    name: String,
-    expected_hash: Option<WoxHashedName>,
-    expected_size: Option<FileSize>,
-}
-
-struct FileList {
-    list: ListHash,
-}
 
 struct Contents {
     data: Vec<u8>,
-    list: FileList,
+    list: WoxReverseDictionary,
 }
 
 #[derive(PartialEq, Debug)]
@@ -135,84 +122,18 @@ struct PayloadBufferedIter<'a> {
     contents_crypt: Option<Crypt>,
 }
 
-impl ListEntry {
-    fn new(name: String) -> ListEntry {
-        ListEntry {
-            name,
-            expected_hash: None,
-            expected_size: None,
-        }
-    }
-}
-
-struct ReadFileList<R>(R)
-where
-    R: Read;
-
-impl<R> TryFrom<ReadFileList<R>> for FileList
-where
-    R: Read,
-{
-    type Error = anyhow::Error;
-
-    fn try_from(input: ReadFileList<R>) -> Result<Self, Self::Error> {
-        let mut list = HashMap::new();
-
-        for maybe_line in BufReader::new(input.0).lines() {
-            let line = maybe_line?;
-
-            if line.is_empty() {
-                continue;
-            }
-
-            let mut csv = line.split(|ch| ch == ',');
-
-            if let Some(name) = csv.next() {
-                ensure!(!name.is_empty(), WoxError::EmptyFileName);
-
-                // Forbid characters that have special meaning for POSIX file systems.
-                for forbidden in [ '/', char::from_u32(0).unwrap() ] {
-                    ensure!(name.find(forbidden).is_none(), WoxError::InvalidCharInFileName(forbidden));
-                }
-
-                let mut entry = ListEntry::new(name.to_string());
-
-                if let Some(hash) = csv.next() {
-                    entry.expected_hash = Some(hash.parse()?);
-                }
-
-                if let Some(size) = csv.next() {
-                    entry.expected_size = Some(size.parse()?);
-                }
-
-                list.insert(WoxHashedName::from(name.as_bytes()), entry);
-            };
-        }
-
-        Ok(Self { list })
-    }
-}
-
-impl Default for FileList {
-    fn default() -> Self {
-        Self {
-            list: HashMap::new(),
-        }
-    }
-}
-
 impl Contents {
-    fn new(data: Vec<u8>, list: FileList) -> Contents {
+    fn new(data: Vec<u8>, list: WoxReverseDictionary) -> Contents {
         Contents { data, list }
     }
 
-    fn find_entry(&self, hash: WoxHashedName) -> Option<&ListEntry> {
-        self.list.list.get(&hash)
+    fn find_entry(&self, hash: WoxHashedName) -> Option<&WoxName> {
+        self.list.inner().get(&hash)
     }
 
     fn entry_name(&self, entry: &TocEntry) -> String {
         match self.find_entry(entry.id) {
-            Some(entry) => entry.name.to_string(),
+            Some(entry) => entry.inner().to_owned(),
             None => format!("{}", entry.id),
         }
     }
@@ -500,7 +421,7 @@ where
     let mut data = Vec::<u8>::new();
     archive_stream.read_to_end(&mut data)?;
 
-    let contents = Contents::new(data, FileList::try_from(ReadFileList(list_stream))?);
+    let contents = Contents::new(data, WoxReverseDictionary::try_from(ReadWoxReverseDictionary(list_stream))?);
 
     root_directory.create_dir_all()?;
 
@@ -653,8 +574,8 @@ where
 
     // Step 1: Load archives data from disk
     let contents = [
-        Contents::new(full_read(a)?, FileList::default()),
-        Contents::new(full_read(b)?, FileList::default()),
+        Contents::new(full_read(a)?, WoxReverseDictionary::default()),
+        Contents::new(full_read(b)?, WoxReverseDictionary::default()),
     ];
 
     // Step 2: If there's a difference in file count, then the archive are different
@@ -733,15 +654,15 @@ fn new_subcommand<'a>(name: &'a str, about: &'a str) -> App<'a, 'a> {
 struct Extract {}
 
 impl Extract {
-    fn execute_with_file_list<S, L>(
+    fn execute_with_dictionary<S, D>(
         &self,
         matches: &ArgMatches,
         stdout: &mut S,
-        file_list: L,
+        dictionary: D,
     ) -> Result<(), anyhow::Error>
     where
         S: Write,
-        L: Read,
+        D: Read,
     {
         let optional_hashes = matches.values_of("file").map(|files_iter| {
             files_iter
@@ -756,7 +677,7 @@ impl Extract {
         extract_cc_file(
             stdout,
             &mut open_file_or_stdin(matches.value_of_os("archive").unwrap())?,
-            file_list,
+            dictionary,
             &VfsPath::new(PhysicalFS::new(
                 Path::new(
                     matches
@@ -798,10 +719,10 @@ where
                     .help("Archive file to extract, use '-' for stdin"),
             )
             .arg(
-                Arg::with_name("fl")
-                    .long("fl")
+                Arg::with_name("dictionary")
+                    .long("dictionary")
                     .value_name("FILE")
-                    .help("Archived files list manifest file"),
+                    .help("Archived files dictionary file"),
             )
             .arg(
                 Arg::with_name("root")
@@ -828,10 +749,10 @@ where
     }
 
     fn execute(&self, matches: &ArgMatches, stdout: &mut S) -> Result<(), anyhow::Error> {
-        if let Some(fl) = matches.value_of_os("fl") {
-            self.execute_with_file_list(matches, stdout, &mut File::open(fl)?)
+        if let Some(dict) = matches.value_of_os("dictionary") {
+            self.execute_with_dictionary(matches, stdout, &mut File::open(dict)?)
         } else {
-            self.execute_with_file_list(matches, stdout, &mut Cursor::new(&[]))
+            self.execute_with_dictionary(matches, stdout, &mut Cursor::new(&[]))
         }
     }
 }
@@ -1081,21 +1002,6 @@ mod tests {
         assert_eq!(PLAINTEXT, &decrypted[..]);
     }
 
-    #[test]
-    fn file_list() {
-        // Allow lines with only the file name.
-        FileList::try_from(ReadFileList(Cursor::new(b"A.TXT\n"))).unwrap();
-
-        // Lines can also come with the hash value as well as the expected file size in bytes.
-        FileList::try_from(ReadFileList(Cursor::new(b"A.TXT,0x1234,1\n"))).unwrap();
-
-        // Disallow empty file names.
-        assert!(FileList::try_from(ReadFileList(Cursor::new(b",0x1234,1\n"))).is_err());
-
-        // File names should not have slashes in them.
-        assert!(FileList::try_from(ReadFileList(Cursor::new(b"INVALID/NAME.TXT\n"))).is_err());
-    }
-
     fn cmdline_expect(subcmd: Option<&str>, arg: &str, on_stdout: bool) {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -1164,18 +1070,22 @@ mod tests {
         file.write_all(contents).unwrap();
     }
 
-    fn build_memory_fs() -> VfsPath {
+    fn build_memory_fs_with_b_name(b_name: &str) -> VfsPath {
         let root = VfsPath::new(MemoryFS::new());
 
         fs_write(&root, "A.TXT", b"A");
-        fs_write(&root, "B.TXT", b"BB");
+        fs_write(&root, b_name, b"BB");
         fs_write(&root, "C.TXT", b"CCC");
 
         root
     }
 
+    fn build_memory_fs() -> VfsPath {
+        build_memory_fs_with_b_name("B.TXT")
+    }
+
     // List of files in the file system created by build_memory_fs().
-    fn archive_file_list() -> Cursor<&'static [u8]> {
+    fn archive_dictionary() -> Cursor<&'static [u8]> {
         Cursor::new(b"A.TXT\nB.TXT\nC.TXT\n")
     }
 
@@ -1217,12 +1127,27 @@ mod tests {
         let root = VfsPath::new(MemoryFS::new());
 
         let mut stdout = vec![];
-        extract_cc_file(&mut stdout, &mut Cursor::new(ARCHIVE_CONTENTS), archive_file_list(), &root, &[], Some(Crypt::Xor)).unwrap();
+        extract_cc_file(&mut stdout, &mut Cursor::new(ARCHIVE_CONTENTS), archive_dictionary(), &root, &[], Some(Crypt::Xor)).unwrap();
 
         // When no hashes are provided, the contents of the archive will be written to the provided
         // file system.
         assert!(stdout.is_empty());
         assert!(compare_fs(&root, &build_memory_fs()));
+    }
+
+    #[test]
+    fn extract_with_partial_dictionary() {
+        let root = VfsPath::new(MemoryFS::new());
+        let partial_dictionary = Cursor::new(b"A.TXT\nC.TXT\n");
+        let b_hashed_name = format!("{}", WoxHashedName::from("B.TXT".as_bytes()).raw());
+
+        let mut stdout = vec![];
+        extract_cc_file(&mut stdout, &mut Cursor::new(ARCHIVE_CONTENTS), partial_dictionary, &root, &[], Some(Crypt::Xor)).unwrap();
+
+        // In this test, we don't have "B.TXT" in the dictionary. As a result, that file will have
+        // the hashed value as name.
+        assert!(stdout.is_empty());
+        assert!(compare_fs(&root, &build_memory_fs_with_b_name(&b_hashed_name)));
     }
 
     #[test]
@@ -1235,7 +1160,7 @@ mod tests {
         ];
 
         let mut stdout = vec![];
-        extract_cc_file(&mut stdout, &mut Cursor::new(ARCHIVE_CONTENTS), archive_file_list(), &root, &hashes, Some(Crypt::Xor)).unwrap();
+        extract_cc_file(&mut stdout, &mut Cursor::new(ARCHIVE_CONTENTS), archive_dictionary(), &root, &hashes, Some(Crypt::Xor)).unwrap();
 
         // With provided hashes, the selected hashes of the archive will be written to the provided
         // "stdout" stream. Ordering of the hashes is expected to be reflected in the output.

@@ -13,7 +13,7 @@ Note: The previous command will download several _Rust_ 3rd party libraries so n
 ## Example Usage
 Extract _xeen.cc_ into directory _extracted_:
 ```sh
-target/release/woxar extract --archive xeen.cc --root extracted --fl data/xeen.fl
+target/release/woxar extract --archive xeen.cc --root extracted --dictionary data/xeen.fl
 ```
 Modify the files in _extracted_ and then repack your modifications as _repacked.cc_:
 ```sh

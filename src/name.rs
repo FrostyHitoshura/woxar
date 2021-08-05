@@ -4,11 +4,13 @@ use thiserror::Error;
 
 use std::{
     cmp::Eq,
+    collections::HashMap,
     convert::{TryFrom, TryInto},
     fmt,
     fmt::{Display, Formatter, LowerHex},
     hash::Hash,
-    io::Write,
+    io,
+    io::{BufRead, BufReader, Read, Write},
     num::ParseIntError,
     str::{from_utf8_unchecked, FromStr},
 };
@@ -247,6 +249,14 @@ fn partial(marked: &BitVec) -> Option<usize> {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum WoxNameError {
+    #[error("Invalid character '{0}' in file name")]
+    InvalidCharInFileName(char),
+    #[error("I/O failed")]
+    Io(#[from] io::Error),
+}
+
 #[derive(PartialEq, Eq, Hash, Copy, Clone, PartialOrd, Ord, Derivative)]
 #[derivative(Debug = "transparent")]
 pub struct WoxHashedName(u16);
@@ -349,133 +359,228 @@ impl NameSet for WoxHashedNameSet {
     }
 }
 
-#[test]
-fn invalid_ascii_names() {
-    assert_eq!(
-        AsciiName::try_from("".as_bytes()),
-        Err(AsciiNameConversionError::IsEmpty)
-    );
+pub struct WoxName(String);
 
-    assert_eq!(
-        AsciiName::try_from("test\0123".as_bytes()),
-        Err(AsciiNameConversionError::NulByte(4))
-    );
-}
-
-#[test]
-fn generator() {
-    let generated = AsciiNameSet::new(b"PREFIX", 10, b".TXT")
-        .unwrap()
-        .generator()
-        .collect::<Vec<_>>();
-
-    const EXPECTED: &[&[u8]] = &[
-        b"PREFIX0.TXT",
-        b"PREFIX1.TXT",
-        b"PREFIX2.TXT",
-        b"PREFIX3.TXT",
-        b"PREFIX4.TXT",
-        b"PREFIX5.TXT",
-        b"PREFIX6.TXT",
-        b"PREFIX7.TXT",
-        b"PREFIX8.TXT",
-        b"PREFIX9.TXT",
-        b"PREFIX10.TXT",
-    ];
-
-    assert_eq!(&generated, EXPECTED);
-}
-
-#[test]
-fn set_completion_ordered_markings() {
-    let mut generator = AsciiNameSet::new(b"PREFIX", 2, b".TXT").unwrap();
-
-    const TESTS: &[&[u8]] = &[b"PREFIX0.TXT", b"PREFIX1.TXT", b"PREFIX2.TXT"];
-
-    assert_eq!(generator.is_partial(), None);
-
-    for (idx, test) in TESTS.iter().enumerate() {
-        assert!(!generator.is_complete());
-
-        let converted: AsciiName = (*test).try_into().unwrap();
-        assert!(generator.eq_and_mark(&converted));
-
-        assert_eq!(generator.is_partial(), Some(idx));
+impl WoxName {
+    pub fn new(name: &str) -> Self {
+        Self(name.to_owned())
     }
 
-    assert!(generator.is_complete());
+    pub fn inner(&self) -> &str {
+        &self.0
+    }
 }
 
-#[test]
-fn set_completion_unordered_markings() {
-    let mut generator = AsciiNameSet::new(b"PREFIX", 2, b".TXT").unwrap();
+pub struct WoxReverseDictionary(HashMap<WoxHashedName, WoxName>);
 
-    const TESTS: &[&[u8]] = &[b"PREFIX2.TXT", b"PREFIX0.TXT", b"PREFIX1.TXT"];
+pub struct ReadWoxReverseDictionary<R>(pub R);
 
-    for test in TESTS {
-        assert!(!generator.is_complete());
+impl<R> TryFrom<ReadWoxReverseDictionary<R>> for WoxReverseDictionary
+where
+    R: Read,
+{
+    type Error = WoxNameError;
+
+    fn try_from(input: ReadWoxReverseDictionary<R>) -> Result<Self, Self::Error> {
+        let mut list = HashMap::new();
+
+        for maybe_line in BufReader::new(input.0).lines() {
+            let name = maybe_line?;
+
+            if name.is_empty() {
+                continue;
+            }
+
+            // Forbid characters that have special meaning for POSIX file systems.
+            for forbidden in ['/', char::from_u32(0).unwrap()] {
+                if name.find(forbidden).is_some() {
+                    return Err(WoxNameError::InvalidCharInFileName(forbidden));
+                }
+            }
+
+            list.insert(WoxHashedName::from(name.as_bytes()), WoxName::new(&name));
+        }
+
+        Ok(Self(list))
+    }
+}
+
+impl Default for WoxReverseDictionary {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl WoxReverseDictionary {
+    pub fn inner(&self) -> &HashMap<WoxHashedName, WoxName> {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn invalid_ascii_names() {
+        assert_eq!(
+            AsciiName::try_from("".as_bytes()),
+            Err(AsciiNameConversionError::IsEmpty)
+        );
+
+        assert_eq!(
+            AsciiName::try_from("test\0123".as_bytes()),
+            Err(AsciiNameConversionError::NulByte(4))
+        );
+    }
+
+    #[test]
+    fn generator() {
+        let generated = AsciiNameSet::new(b"PREFIX", 10, b".TXT")
+            .unwrap()
+            .generator()
+            .collect::<Vec<_>>();
+
+        const EXPECTED: &[&[u8]] = &[
+            b"PREFIX0.TXT",
+            b"PREFIX1.TXT",
+            b"PREFIX2.TXT",
+            b"PREFIX3.TXT",
+            b"PREFIX4.TXT",
+            b"PREFIX5.TXT",
+            b"PREFIX6.TXT",
+            b"PREFIX7.TXT",
+            b"PREFIX8.TXT",
+            b"PREFIX9.TXT",
+            b"PREFIX10.TXT",
+        ];
+
+        assert_eq!(&generated, EXPECTED);
+    }
+
+    #[test]
+    fn set_completion_ordered_markings() {
+        let mut generator = AsciiNameSet::new(b"PREFIX", 2, b".TXT").unwrap();
+
+        const TESTS: &[&[u8]] = &[b"PREFIX0.TXT", b"PREFIX1.TXT", b"PREFIX2.TXT"];
+
         assert_eq!(generator.is_partial(), None);
 
-        let converted: AsciiName = (*test).try_into().unwrap();
-        assert!(generator.eq_and_mark(&converted));
+        for (idx, test) in TESTS.iter().enumerate() {
+            assert!(!generator.is_complete());
+
+            let converted: AsciiName = (*test).try_into().unwrap();
+            assert!(generator.eq_and_mark(&converted));
+
+            assert_eq!(generator.is_partial(), Some(idx));
+        }
+
+        assert!(generator.is_complete());
     }
 
-    assert!(generator.is_complete());
-    assert_eq!(generator.is_partial(), Some(2));
-}
+    #[test]
+    fn set_completion_unordered_markings() {
+        let mut generator = AsciiNameSet::new(b"PREFIX", 2, b".TXT").unwrap();
 
-#[test]
-fn fuzz_mark_parsing() {
-    let mut generator = AsciiNameSet::new(b"PREFIX", 1, b".TXT").unwrap();
+        const TESTS: &[&[u8]] = &[b"PREFIX2.TXT", b"PREFIX0.TXT", b"PREFIX1.TXT"];
 
-    const TESTS: &[&[u8]] = &[
-        b"0.TXT",
-        b"0",
-        b".TXT",
-        b"PREFIX01.TXT",
-        b"PREFIX2.TXT",
-        b"PREFIX0.TXT.TXT",
-    ];
+        for test in TESTS {
+            assert!(!generator.is_complete());
+            assert_eq!(generator.is_partial(), None);
 
-    for test in TESTS {
-        let converted: AsciiName = (*test).try_into().unwrap();
-        assert!(!generator.eq_and_mark(&converted));
-    }
-}
+            let converted: AsciiName = (*test).try_into().unwrap();
+            assert!(generator.eq_and_mark(&converted));
+        }
 
-#[test]
-fn wox_hash() {
-    // Not expected to happen for real, simply make sure we don't crash!
-    const EMPTY: &[u8] = &[];
-    assert_eq!(WoxHashedName::from(EMPTY), WoxHashedName(0xffff));
-
-    const SIXTY_FOUR: &[u8] = &[64];
-    assert_eq!(WoxHashedName::from(SIXTY_FOUR), WoxHashedName(64));
-
-    const TWO_BYTES: &[u8] = &[12, 34];
-    assert_eq!(WoxHashedName::from(TWO_BYTES), WoxHashedName(6178));
-}
-
-#[test]
-fn wox_hashed_name_set() {
-    let ascii_set = AsciiNameSet::new(b"OUT", 5, b".SPL").unwrap();
-    let mut wox_set = WoxHashedNameSet::from(&ascii_set);
-
-    for (idx, ascii_name) in ascii_set.generator().enumerate() {
-        assert!(wox_set.eq_and_mark(&WoxHashedName::from(ascii_name.as_slice())));
-        assert_eq!(wox_set.is_partial(), Some(idx));
+        assert!(generator.is_complete());
+        assert_eq!(generator.is_partial(), Some(2));
     }
 
-    assert!(wox_set.is_complete());
-    assert_eq!(
-        &wox_set.hashes,
-        &[
-            WoxHashedName(0x2a0c),
-            WoxHashedName(0x2a1c),
-            WoxHashedName(0x2a2c),
-            WoxHashedName(0x2a3c),
-            WoxHashedName(0x284c),
-            WoxHashedName(0x2a5c)
-        ]
-    );
+    #[test]
+    fn fuzz_mark_parsing() {
+        let mut generator = AsciiNameSet::new(b"PREFIX", 1, b".TXT").unwrap();
+
+        const TESTS: &[&[u8]] = &[
+            b"0.TXT",
+            b"0",
+            b".TXT",
+            b"PREFIX01.TXT",
+            b"PREFIX2.TXT",
+            b"PREFIX0.TXT.TXT",
+        ];
+
+        for test in TESTS {
+            let converted: AsciiName = (*test).try_into().unwrap();
+            assert!(!generator.eq_and_mark(&converted));
+        }
+    }
+
+    #[test]
+    fn wox_hash() {
+        // Not expected to happen for real, simply make sure we don't crash!
+        const EMPTY: &[u8] = &[];
+        assert_eq!(WoxHashedName::from(EMPTY), WoxHashedName(0xffff));
+
+        const SIXTY_FOUR: &[u8] = &[64];
+        assert_eq!(WoxHashedName::from(SIXTY_FOUR), WoxHashedName(64));
+
+        const TWO_BYTES: &[u8] = &[12, 34];
+        assert_eq!(WoxHashedName::from(TWO_BYTES), WoxHashedName(6178));
+    }
+
+    #[test]
+    fn wox_hashed_name_set() {
+        let ascii_set = AsciiNameSet::new(b"OUT", 5, b".SPL").unwrap();
+        let mut wox_set = WoxHashedNameSet::from(&ascii_set);
+
+        for (idx, ascii_name) in ascii_set.generator().enumerate() {
+            assert!(wox_set.eq_and_mark(&WoxHashedName::from(ascii_name.as_slice())));
+            assert_eq!(wox_set.is_partial(), Some(idx));
+        }
+
+        assert!(wox_set.is_complete());
+        assert_eq!(
+            &wox_set.hashes,
+            &[
+                WoxHashedName(0x2a0c),
+                WoxHashedName(0x2a1c),
+                WoxHashedName(0x2a2c),
+                WoxHashedName(0x2a3c),
+                WoxHashedName(0x284c),
+                WoxHashedName(0x2a5c)
+            ]
+        );
+    }
+
+    #[test]
+    fn wox_reverse_dictionary() {
+        // Allow lines with only the file name.
+        WoxReverseDictionary::try_from(ReadWoxReverseDictionary(Cursor::new(b"A.TXT\n"))).unwrap();
+
+        // Lines can also come with the hash value as well as the expected file size in bytes.
+        WoxReverseDictionary::try_from(ReadWoxReverseDictionary(Cursor::new(b"A.TXT\n"))).unwrap();
+
+        // Allow empty lines.
+        assert!(
+            WoxReverseDictionary::try_from(ReadWoxReverseDictionary(Cursor::new(b"\n")))
+                .unwrap()
+                .0
+                .is_empty()
+        );
+
+        // File names should be POSIX compatible, no slashes nor NUL.
+        assert!(
+            WoxReverseDictionary::try_from(ReadWoxReverseDictionary(Cursor::new(
+                b"INVALID/NAME.TXT\n"
+            )))
+            .is_err()
+        );
+        assert!(
+            WoxReverseDictionary::try_from(ReadWoxReverseDictionary(Cursor::new(
+                b"INVALID\0NAME.TXT\n"
+            )))
+            .is_err()
+        );
+    }
 }
