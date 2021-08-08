@@ -257,6 +257,8 @@ pub enum WoxNameError {
     CurrentDirectory,
     #[error("Invalid special parent directory name")]
     ParentDirectory,
+    #[error("Names '{0}' and '{1}' produce the same hash")]
+    SameHash(WoxName, WoxName),
     #[error("I/O failed")]
     Io(#[from] io::Error),
 }
@@ -363,6 +365,8 @@ impl NameSet for WoxHashedNameSet {
     }
 }
 
+#[derive(Derivative)]
+#[derivative(Debug = "transparent")]
 pub struct WoxName(String);
 
 impl WoxName {
@@ -372,6 +376,12 @@ impl WoxName {
 
     pub fn inner(&self) -> &str {
         &self.0
+    }
+}
+
+impl Display for WoxName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.0, f)
     }
 }
 
@@ -402,11 +412,19 @@ where
                 }
             }
 
-            // Forbid attempts at a file system traversal attack.
             match name.as_str() {
+                // Forbid attempts at a file system traversal attack.
                 "." => return Err(WoxNameError::CurrentDirectory),
                 ".." => return Err(WoxNameError::ParentDirectory),
-                _ => list.insert(WoxHashedName::from(name.as_bytes()), WoxName::new(&name)),
+
+                _ => {
+                    let wox_name = WoxName::new(&name);
+                    if let Some(existing_name) =
+                        list.insert(WoxHashedName::from(name.as_bytes()), wox_name)
+                    {
+                        return Err(WoxNameError::SameHash(WoxName::new(&name), existing_name));
+                    }
+                }
             };
         }
 
@@ -578,12 +596,14 @@ mod tests {
                 .is_empty()
         );
 
-        // File names should be POSIX compatible, no slashes nor NUL and do now allow names with special meaning.
         for test in &[
+            // File names should be POSIX compatible, no slashes nor NUL and do now allow names with special meaning.
             "INVALID/NAME.TXT\n".as_bytes(),
             "INVALID\0NAME.TXT\n".as_bytes(),
             ".\n".as_bytes(),
             "..\n".as_bytes(),
+            // Easy way to reproduce a hash collision: repeat the same file name.
+            "REPEAT\nB.TXT\nREPEAT\n".as_bytes(),
         ] {
             assert!(
                 WoxReverseDictionary::try_from(ReadWoxReverseDictionary(Cursor::new(test)))
