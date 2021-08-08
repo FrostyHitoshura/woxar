@@ -253,6 +253,10 @@ fn partial(marked: &BitVec) -> Option<usize> {
 pub enum WoxNameError {
     #[error("Invalid character '{0}' in file name")]
     InvalidCharInFileName(char),
+    #[error("Invalid special current directory name")]
+    CurrentDirectory,
+    #[error("Invalid special parent directory name")]
+    ParentDirectory,
     #[error("I/O failed")]
     Io(#[from] io::Error),
 }
@@ -398,7 +402,12 @@ where
                 }
             }
 
-            list.insert(WoxHashedName::from(name.as_bytes()), WoxName::new(&name));
+            // Forbid attempts at a file system traversal attack.
+            match name.as_str() {
+                "." => return Err(WoxNameError::CurrentDirectory),
+                ".." => return Err(WoxNameError::ParentDirectory),
+                _ => list.insert(WoxHashedName::from(name.as_bytes()), WoxName::new(&name)),
+            };
         }
 
         Ok(Self(list))
@@ -569,18 +578,17 @@ mod tests {
                 .is_empty()
         );
 
-        // File names should be POSIX compatible, no slashes nor NUL.
-        assert!(
-            WoxReverseDictionary::try_from(ReadWoxReverseDictionary(Cursor::new(
-                b"INVALID/NAME.TXT\n"
-            )))
-            .is_err()
-        );
-        assert!(
-            WoxReverseDictionary::try_from(ReadWoxReverseDictionary(Cursor::new(
-                b"INVALID\0NAME.TXT\n"
-            )))
-            .is_err()
-        );
+        // File names should be POSIX compatible, no slashes nor NUL and do now allow names with special meaning.
+        for test in &[
+            "INVALID/NAME.TXT\n".as_bytes(),
+            "INVALID\0NAME.TXT\n".as_bytes(),
+            ".\n".as_bytes(),
+            "..\n".as_bytes(),
+        ] {
+            assert!(
+                WoxReverseDictionary::try_from(ReadWoxReverseDictionary(Cursor::new(test)))
+                    .is_err()
+            );
+        }
     }
 }
